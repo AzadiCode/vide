@@ -49,7 +49,8 @@ else:
 db.sessions.create_index("t")
 
 HOOK_SECRET = hashlib.sha256(("reel" + BOT_TOKEN).encode()).hexdigest()[:32]
-jobs = queue.Queue()
+jobs = queue.Queue()     # صف رندر ویدیو
+ajobs = queue.Queue()    # صف تحلیل ویس (جدا از رندر تا پشت رندر کند گیر نکنه)
 state_lock = threading.Lock()
 busy_now = {"v": False}
 
@@ -254,6 +255,7 @@ def analyze_job(uid):
     work = tempfile.mkdtemp(prefix="rv_")
     try:
         vp = tg_download(s["voice"]["fid"], os.path.join(work, "voice"))
+        log.info("analyze: downloaded %s bytes", os.path.getsize(vp))
         err = run([FFMPEG, "-hide_banner", "-nostats", "-i", vp, "-vn",
                    "-af", f"silencedetect=noise={SIL_DB}:d={SIL_MIN}", "-f", "null", "-"], timeout=120)
         dur, sil = parse_silence(err)
@@ -344,26 +346,30 @@ def render_job(uid):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def worker():
+def worker(q, kind):
     while True:
         try:
-            kind, uid = jobs.get(timeout=1800)
+            uid = q.get(timeout=1800)
         except queue.Empty:
             try:   # پاکسازی نشست‌های قدیمی
                 db.sessions.delete_many({"t": {"$lt": now() - timedelta(hours=24)}, "step": {"$nin": list(BUSY)}})
             except Exception:
                 log.exception("cleanup failed")
             continue
-        with state_lock:
-            busy_now["v"] = True
+        if kind == "render":
+            with state_lock:
+                busy_now["v"] = True
+        log.info("job %s start uid=%s", kind, uid)
         try:
             analyze_job(uid) if kind == "analyze" else render_job(uid)
         except Exception:
             log.exception("job crashed")
         finally:
-            with state_lock:
-                busy_now["v"] = False
-            jobs.task_done()
+            log.info("job %s done uid=%s", kind, uid)
+            if kind == "render":
+                with state_lock:
+                    busy_now["v"] = False
+            q.task_done()
 
 
 # ───────────────────────── هندلرها ─────────────────────────
@@ -445,7 +451,7 @@ def on_message(msg):
     db.sessions.update_one({"_id": uid}, {"$set": {"slides": slides, "chat": chat, "step": "analyzing", "t": now(),
                                                    "voice": {"fid": voice["file_id"], "dur": voice.get("duration", 0)}}})
     say(chat, f"🔍 در حال تحلیل ویس و تقسیم بین {len(slides)} اسلاید…")
-    jobs.put(("analyze", uid))
+    ajobs.put(uid)
 
 
 def on_callback(cq):
@@ -523,7 +529,7 @@ def on_callback(cq):
         pos = jobs.qsize() + (1 if busy_now["v"] else 0)
         ans()
         edit(chat, mid, f"📋 در صف ساخت قرار گرفتی ({pos + 1}). به‌محض آماده شدن ویدیو براخودت می‌فرستم.")
-        jobs.put(("render", uid))
+        jobs.put(uid)
         return
 
 
@@ -549,8 +555,12 @@ def hook():
 
 def setup():
     # کارهای نیمه‌تمومِ قبل از ری‌استارت (صف داخل حافظه بود) برمی‌گردن به مرحله‌ی قبل
-    db.sessions.update_many({"step": {"$in": ["queued", "rendering"]}}, {"$set": {"step": "review"}})
-    db.sessions.update_many({"step": "analyzing"}, {"$set": {"step": "voice"}})
+    for st_from, st_to, msg in (("queued", "review", "🔄 سرور ری‌استارت شد و ساخت ویدیو قطع شد. دوباره «ساخت ویدیو» رو بزن."),
+                                ("rendering", "review", "🔄 سرور ری‌استارت شد و ساخت ویدیو قطع شد. دوباره «ساخت ویدیو» رو بزن."),
+                                ("analyzing", "voice", "🔄 سرور ری‌استارت شد و تحلیل ویس قطع شد. ویس رو دوباره بفرست.")):
+        for d in list(db.sessions.find({"step": st_from})):
+            db.sessions.update_one({"_id": d["_id"]}, {"$set": {"step": st_to}})
+            say(d["chat"], msg)   # کاربر دیگه بی‌خبر گیر نمی‌کنه
     r = tg("setWebhook", url=f"{BASE_URL}/hook", secret_token=HOOK_SECRET,
            allowed_updates=["message", "callback_query"])
     tg("setMyCommands", commands=[{"command": "new", "description": "ساخت ویدیوی جدید"},
@@ -560,7 +570,8 @@ def setup():
 
 
 setup()
-threading.Thread(target=worker, daemon=True).start()
+threading.Thread(target=worker, args=(ajobs, "analyze"), daemon=True).start()
+threading.Thread(target=worker, args=(jobs, "render"), daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
