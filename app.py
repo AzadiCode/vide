@@ -8,7 +8,8 @@ Stack (مثل app-6): Flask + MongoDB(pymongo / mongomock) + وب‌هوک تل�
 - ساخت ویدیو در یه صف تک‌نفره (مناسب پلن رایگان Render: رم کم / CPU ضعیف)
 اجرا: gunicorn app:app -w 1 --threads 4 -t 120   (حتما یک worker، چون صف داخل حافظه‌ست)
 """
-import os, re, time, hashlib, logging, shutil, subprocess, tempfile, threading, queue
+import os, re, time, hashlib, logging, shutil, subprocess, tempfile, threading
+from collections import deque
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -49,8 +50,10 @@ else:
 db.sessions.create_index("t")
 
 HOOK_SECRET = hashlib.sha256(("reel" + BOT_TOKEN).encode()).hexdigest()[:32]
-jobs = queue.Queue()     # صف رندر ویدیو
-ajobs = queue.Queue()    # صف تحلیل ویس (جدا از رندر تا پشت رندر کند گیر نکنه)
+# صف‌ها deque ساده‌ان و ترد با polling بررسیشون می‌کنه (نه Queue استاندارد)؛ چون Condition داخل Queue بعد از fork گانیکورن
+# یه waiter مرده نگه می‌داره و ترد جدید رو هیچ‌وقت بیدار نمی‌کنه
+jobs = deque()     # صف رندر ویدیو
+ajobs = deque()    # صف تحلیل ویس (جدا از رندر تا پشت رندر کند گیر نکنه)
 state_lock = threading.Lock()
 busy_now = {"v": False}
 
@@ -138,7 +141,7 @@ def watchdog(uid, chat):
     since = f"{time.time() - s['stage_t']:.0f} ثانیه پیش" if s.get("stage_t") else "-"
     say(chat, "⚠️ تحلیل ویس طولانی شد.\n"
               f"مرحله: {s.get('stage', 'هنوز شروع نشده')} ({since})\n"
-              f"ترد تحلیل زنده: {'بله' if th and th.is_alive() else 'نه'} • صف: {ajobs.qsize()}\n"
+              f"ترد تحلیل زنده: {'بله' if th and th.is_alive() else 'نه'} • صف: {len(ajobs)}\n"
               f"ffmpeg: {FFVER}")
 
 
@@ -378,14 +381,18 @@ def render_job(uid):
 
 
 def worker(q, kind):
+    last_clean = time.time()
     while True:
         try:
-            uid = q.get(timeout=1800)
-        except queue.Empty:
-            try:   # پاکسازی نشست‌های قدیمی
-                db.sessions.delete_many({"t": {"$lt": now() - timedelta(hours=24)}, "step": {"$nin": list(BUSY)}})
-            except Exception:
-                log.exception("cleanup failed")
+            uid = q.popleft()
+        except IndexError:
+            time.sleep(0.5)
+            if time.time() - last_clean > 1800:   # پاکسازی نشست‌های قدیمی
+                last_clean = time.time()
+                try:
+                    db.sessions.delete_many({"t": {"$lt": now() - timedelta(hours=24)}, "step": {"$nin": list(BUSY)}})
+                except Exception:
+                    log.exception("cleanup failed")
             continue
         if kind == "render":
             with state_lock:
@@ -400,7 +407,6 @@ def worker(q, kind):
             if kind == "render":
                 with state_lock:
                     busy_now["v"] = False
-            q.task_done()
 
 
 # ───────────────────────── هندلرها ─────────────────────────
@@ -433,8 +439,8 @@ def on_message(msg):
             say(chat, help_text())
         elif cmd == "debug":
             ta, tr = THREADS.get("analyze"), THREADS.get("render")
-            say(chat, f"ffmpeg: {FFVER}\nترد تحلیل: {'زنده' if ta and ta.is_alive() else 'مرده'} (صف {ajobs.qsize()})\n"
-                      f"ترد رندر: {'زنده' if tr and tr.is_alive() else 'مرده'} (صف {jobs.qsize()})\n"
+            say(chat, f"ffmpeg: {FFVER}\nترد تحلیل: {'زنده' if ta and ta.is_alive() else 'مرده'} (صف {len(ajobs)})\n"
+                      f"ترد رندر: {'زنده' if tr and tr.is_alive() else 'مرده'} (صف {len(jobs)})\n"
                       f"نشست تو: {(s or {}).get('step', '-')} / {(s or {}).get('stage', '-')}")
         elif cmd in ("new", "cancel"):
             if s and s.get("step") in BUSY:
@@ -488,7 +494,7 @@ def on_message(msg):
                                                    "voice": {"fid": voice["file_id"], "dur": voice.get("duration", 0)}},
                                      "$unset": {"stage": ""}})
     say(chat, f"🔍 در حال تحلیل ویس و تقسیم بین {len(slides)} اسلاید…")
-    ajobs.put(uid)
+    ajobs.append(uid)
     threading.Timer(45, watchdog, args=(uid, chat)).start()
 
 
@@ -564,10 +570,10 @@ def on_callback(cq):
         if not quota_take(uid):
             db.sessions.update_one({"_id": uid}, {"$set": {"step": "review"}})
             return ans(f"سهمیه‌ی امروزت ({DAILY_LIMIT} ویدیو) تموم شده؛ فردا دوباره امتحان کن.", True)
-        pos = jobs.qsize() + (1 if busy_now["v"] else 0)
+        pos = len(jobs) + (1 if busy_now["v"] else 0)
         ans()
         edit(chat, mid, f"📋 در صف ساخت قرار گرفتی ({pos + 1}). به‌محض آماده شدن ویدیو براخودت می‌فرستم.")
-        jobs.put(uid)
+        jobs.append(uid)
         return
 
 
