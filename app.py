@@ -6,9 +6,9 @@ Stack (مثل app-6): Flask + MongoDB(pymongo / mongomock) + وب‌هوک تل�
 - ویس با ffmpeg silencedetect روی مکث‌ها بین اسلایدها تقسیم می‌شه (یا مساوی)، با دکمه قابل تنظیمه
 - تقسیم مکث‌محورِ حرفه‌ای‌تر: آستانه‌ی سکوت خودکار از روی بلندی صدای خود ویس، انتخاب برش‌ها با DP (مکث‌های قوی + طول متعادل)
   و گذاشتن برش درست قبل از شروع جمله‌ی بعدی (بدون هیچ API یا سرویس بیرونی)
-- انیمیشن حرفه‌ای (FX=pro): ترنزیشن واقعی بین اسلایدها (کراس‌فید/اسلاید نرم، وسط برشِ صدا)، زوم/پن با شتاب نرم (ease)،
-  کارت گوشه‌گرد با سایه روی پس‌زمینه‌ی بلور، و نوار پیشرفت بالای ویدیو. اگه ffmpeg ترنزیشن نداشت یا خطا داد، خودکار حالت ساده (FX=lite) اجرا می‌شه
-- خروجی: ویدیوی ۹:۱۶ با پس‌زمینه‌ی بلور، زوم/پن ملایم، فید بین اسلایدها و صدای نرمال‌شده
+- انیمیشن ساده و حرفه‌ای: هر اسلاید تمام‌صفحه (بدون بلور، بدون کارت و کادر، بدون نوار بالا)، زوم خیلی نرم با شتاب ease،
+  و کراس‌فید کوتاه بین اسلایدها که وسط نقطه‌ی برشِ صدا می‌افته. کل ویدیو تو یه پاس ffmpeg ساخته می‌شه. اگه ffmpeg xfade نداشت یا خطا داد، خودکار برش مستقیم (FX=lite)
+- خروجی: ویدیوی ۹:۱۶ تمام‌صفحه با زوم نرم، کراس‌فید بین اسلایدها و صدای نرمال‌شده
 - ساخت ویدیو در یه صف تک‌نفره (مناسب پلن رایگان Render: رم کم / CPU ضعیف)
 اجرا: gunicorn app:app -w 1 --threads 4 -t 120   (حتما یک worker، چون صف داخل حافظه‌ست)
 """
@@ -33,13 +33,15 @@ VIDEO_W     = int(os.environ.get("VIDEO_W", "720"))
 VIDEO_H     = int(os.environ.get("VIDEO_H", "1280"))
 FPS         = int(os.environ.get("FPS", "25"))
 PRESET      = os.environ.get("X264_PRESET", "ultrafast")
-CRF         = int(os.environ.get("CRF", "27"))
+CRF         = int(os.environ.get("CRF", "24"))
 SIL_DB      = os.environ.get("SIL_DB", "auto")              # آستانه‌ی سکوت؛ auto = از روی بلندی خود ویس حساب می‌شه
 SIL_MIN     = float(os.environ.get("SIL_MIN", "0.18"))      # حداقل طول مکث (ثانیه)؛ مکث‌های کوتاه هم دیده می‌شن، قدرتشون در DP سنجیده می‌شه
 DEBUG       = os.environ.get("DEBUG", "") == "1"            # علت دقیق خطا رو برای کاربر نشون می‌ده
-FX_MODE     = os.environ.get("FX", "pro").strip().lower()   # pro = انیمیشن کامل | lite = ساده و سریع (مثل قبل)
-TRANS_SEC   = float(os.environ.get("TRANS_SEC", "0.32"))    # طول ترنزیشن بین اسلایدها (ثانیه)
-FX_BUDGET   = int(os.environ.get("FX_BUDGET", "480"))       # بیشترین زمان مجاز برای ساخت افکت‌ها (ثانیه)؛ بیشتر شد، خودکار نسخه‌ی ساده ساخته می‌شه
+FX_MODE     = os.environ.get("FX", "pro").strip().lower()   # pro = زوم نرم + کراس‌فید | lite = زوم نرم + برش مستقیم (بدون کراس‌فید)
+TRANS_SEC   = float(os.environ.get("TRANS_SEC", "0.30"))    # طول کراس‌فید بین اسلایدها (ثانیه)
+ZOOM_AMT    = float(os.environ.get("ZOOM_AMT", "0.07"))     # مقدار زوم هر اسلاید (۰.۰۷ = ۷٪)؛ هرچی کمتر، آروم‌تر و کم‌برش‌تر
+ZOOM_CANVAS = float(os.environ.get("ZOOM_CANVAS", "3"))     # ترکیب زوم روی بوم چند برابر بزرگ‌تر؛ بیشتر = نرم‌تر (و کمی کندتر)
+FX_BUDGET   = int(os.environ.get("FX_BUDGET", "480"))       # بیشترین زمان مجاز ساخت ویدیو (ثانیه)؛ بیشتر شد، خودکار نسخه‌ی ساده ساخته می‌شه
 MIN_SEG     = 1.0    # حداقل طول هر اسلاید در تقسیم خودکار
 MIN_ADJ     = 0.5    # حداقل طول هر اسلاید موقع تنظیم دستی
 BUSY        = ("analyzing", "queued", "rendering")
@@ -299,165 +301,50 @@ def cuts_greedy(sil, n, t0, t1):
     return [round(c, 2) for c in sorted(cuts)], found
 
 
-def make_clip(img, out, n, idx):
-    """یه اسلاید → کلیپ: پس‌زمینه‌ی بلور + عکس وسط + زوم/پن ملایم + فید ورودی/خروجی"""
+def _slide_chain(idx, i_label, L, out_label):
+    """یه اسلاید → استریم تمام‌صفحه‌ی ۹:۱۶ (بدون بلور، بدون کادر) با زوم خیلی نرم.
+    ترکیب روی بوم بزرگ‌تر (ZOOM_CANVAS برابر) انجام می‌شه تا حرکت زوم پله‌پله/لرزان نشه؛ شتاب با smoothstep نرم شروع و تموم می‌شه"""
     W, H = VIDEO_W, VIDEO_H
-    bw, bh = W * 3 // 2, H * 3 // 2          # ترکیب در سایز بزرگ‌تر تا زوم نلرزه
-    if idx % 3 == 0:
-        z, x, y = f"1+0.12*on/{n}", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
-    elif idx % 3 == 1:
-        z, x, y = f"1.12-0.12*on/{n}", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
-    else:
-        z, x, y = "1.1", f"(iw-iw/zoom)*on/{n}", "ih/2-(ih/zoom/2)"
-    fd = 0.2
-    fo = max(n / FPS - fd, 0)
-    fc = (f"[0:v]split[a][b];"
-          f"[a]scale={bw}:{bh}:force_original_aspect_ratio=increase,crop={bw}:{bh},boxblur=25:3,eq=brightness=-0.08[bg];"
-          f"[b]scale={bw}:{bh}:force_original_aspect_ratio=decrease[fg];"
-          f"[bg][fg]overlay=(W-w)/2:(H-h)/2,"
-          f"zoompan=z='{z}':x='{x}':y='{y}':d={n}:s={W}x{H}:fps={FPS},"
-          f"fade=t=in:st=0:d={fd},fade=t=out:st={fo:.3f}:d={fd},format=yuv420p[v]")
+    cw, ch = int(W * ZOOM_CANVAS) // 2 * 2, int(H * ZOOM_CANVAS) // 2 * 2
+    p = f"(on/{L})"
+    e = f"({p}*{p}*(3-2*{p}))"
+    z = f"1+{ZOOM_AMT}*{e}" if idx % 2 == 0 else f"1+{ZOOM_AMT}-{ZOOM_AMT}*{e}"      # یکی در میون: زوم‌این / زوم‌اوت
+    return (f"[{i_label}:v]scale={cw}:{ch}:force_original_aspect_ratio=increase,crop={cw}:{ch},"
+            f"zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={L}:s={W}x{H}:fps={FPS},"
+            f"setsar=1,format=yuv420p[{out_label}]")
+
+
+def make_clip(img, out, n, idx):
+    """حالت ساده (برش مستقیم بین اسلایدها): یه اسلاید → کلیپ تمام‌صفحه با زوم نرم"""
+    fc = _slide_chain(idx, 0, n, "v")
     run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", img, "-filter_complex", fc, "-map", "[v]",
          "-frames:v", str(n), "-r", str(FPS), "-c:v", "libx264", "-preset", PRESET, "-crf", str(CRF),
          "-threads", "1", "-pix_fmt", "yuv420p", "-an", out], timeout=240)
 
 
-# ───────────────────── انیمیشن حرفه‌ای (FX=pro) ─────────────────────
-TRANS = ["fade", "smoothleft", "fade", "smoothup", "smoothright"]   # ترتیب ترنزیشن‌ها؛ آروم و تمیز
-BAR_M, BAR_Y, BAR_H = 36, 44, 6                                    # حاشیه، فاصله از بالا و ضخامت نوار پیشرفت
-
-
-def make_card(img, png, timeout):
-    """ترکیب ثابت یه اسلاید (فقط یک فریم): پس‌زمینه‌ی بلور + کارت گوشه‌گرد با سایه → PNG. این کار برای هر اسلاید فقط یک‌بار انجام می‌شه"""
-    W, H = VIDEO_W, VIDEO_H
-    S = 1.5                                            # ترکیب در سایز بزرگ‌تر تا زوم نلرزه
-    bw, bh = int(W * S) // 2 * 2, int(H * S) // 2 * 2
-    cw, ch = int(bw * 0.90), int(bh * 0.80)            # بیشترین اندازه‌ی کارت
-    R, P = int(26 * S), int(22 * S)                    # شعاع گوشه، پدینگ سایه
-    alpha = (f"if(gt(abs(W/2-X),W/2-{R})*gt(abs(H/2-Y),H/2-{R}),"
-             f"255*clip({R}-hypot(abs(W/2-X)-(W/2-{R}),abs(H/2-Y)-(H/2-{R}))+0.5,0,1),255)")
-    fc = (f"[0:v]split[a][b];"
-          f"[a]scale={bw}:{bh}:force_original_aspect_ratio=increase,crop={bw}:{bh},boxblur=30:3,"
-          f"eq=brightness=-0.10:saturation=1.15[bg];"
-          f"[b]scale={cw}:{ch}:force_original_aspect_ratio=decrease,format=rgba,"
-          f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{alpha}',split[c1][c2];"
-          f"[c2]colorchannelmixer=rr=0:gg=0:bb=0:aa=0.6,pad=iw+{2 * P}:ih+{2 * P}:{P}:{P}:color=black@0,"
-          f"boxblur={P // 2}:2[sh];"
-          f"[bg][sh]overlay=x=(W-w)/2:y=(H-h)/2+{int(12 * S)}:format=auto[t1];"
-          f"[t1][c1]overlay=x=(W-w)/2:y=(H-h)/2:format=auto,format=rgb24[v0]")
-    run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", img, "-filter_complex", fc, "-map", "[v0]",
-         "-frames:v", "1", png], timeout=timeout)
-
-
-def _motion(L, idx, off, frames):
-    """حرکت دوربین (زوم/پن با شتاب نرم) برای فریم‌های off..off+frames از کلیپ L فریمی"""
-    W, H = VIDEO_W, VIDEO_H
-    pr = f"((on+{off})/{L})"
-    e = f"({pr}*{pr}*(3-2*{pr}))"                       # smoothstep: شروع و پایان نرم
-    zi, y = 0.09, "ih/2-(ih/zoom/2)"
-    m = idx % 4
-    if m == 0:
-        z, x = f"1+{zi}*{e}", "iw/2-(iw/zoom/2)"
-    elif m == 1:
-        z, x = f"1+{zi}-{zi}*{e}", "iw/2-(iw/zoom/2)"
-    elif m == 2:
-        z, x = "1.08", f"(iw-iw/zoom)*{e}"
-    else:
-        z, x = "1.08", f"(iw-iw/zoom)*(1-{e})"
-    return f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps={FPS},format=yuv420p"
-
-
-def _bar(src, dst, dur, off, ts, ticks, fade_out=False):
-    """نوار پیشرفت: dur = طول این تکه، off = شروع این تکه در کل ویدیو، ts = طول کل ویدیو (ثانیه)"""
-    tw = VIDEO_W - 2 * BAR_M
-    fd = f",fade=t=out:st={max(dur - 0.3, 0):.3f}:d=0.3" if fade_out else ""
-    return [f"color=c=0x8a8a8a:s={tw}x{BAR_H}:r={FPS}:d={dur:.3f}[trk]",
-            f"color=c=white:s={tw}x{BAR_H}:r={FPS}:d={dur:.3f}[fil]",
-            f"[trk][fil]overlay=x='-{tw}+{tw}*min((t+{off:.4f})/{ts:.3f},1)':y=0{ticks},"
-            f"format=rgba,colorchannelmixer=aa=0.9[bar]",
-            f"{src}[bar]overlay=x={BAR_M}:y={BAR_Y}:format=auto:shortest=1{fd},format=yuv420p[{dst}]"]
-
-
-def _enc(crf, frames):
-    return ["-r", str(FPS), "-frames:v", str(frames), "-c:v", "libx264", "-preset", PRESET, "-crf", str(crf),
-            "-threads", "1", "-pix_fmt", "yuv420p", "-an"]
-
-
-def make_piece(png, idx, L, off, frames, out, crf, timeout, bar=None):
-    """یه تکه از حرکتِ اسلاید (فریم‌های off تا off+frames از L) → ویدیو. bar = (شروع در کل ویدیو، طول کل، تیک‌ها، آخری؟)"""
-    fc = [f"[0:v]{_motion(L, idx, off, frames)}[v0]"]
-    lab = "[v0]"
-    if bar:
-        boff, ts, ticks, last = bar
-        fc += _bar("[v0]", "bo", frames / FPS, boff, ts, ticks, last)
-        lab = "[bo]"
-    run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", png, "-filter_complex", ";".join(fc),
-         "-map", lab] + _enc(crf, frames) + [out], timeout=timeout)
-
-
-def make_trans(tail_p, head_p, tr, d_f, out, bar, timeout):
-    """ترنزیشن بین دو اسلاید: فقط روی ~۰.۳ ثانیه (چند فریم) کار می‌کنه، نه کل ویدیو"""
-    off, ts, ticks = bar
-    fc = [f"[0:v][1:v]xfade=transition={tr}:duration={d_f / FPS:.4f}:offset=0[xf]"]
-    fc += _bar("[xf]", "vo", d_f / FPS, off, ts, ticks)
-    run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", tail_p, "-i", head_p,
-         "-filter_complex", ";".join(fc), "-map", "[vo]"] + _enc(CRF, d_f) + [out], timeout=timeout)
-
-
-def build_fx(uid, imgs, nf, work, prog):
-    """هر اسلاید یک‌بار رندر می‌شه و به تکه‌های (بدنه + سر/دم ترنزیشن) شکسته می‌شه؛ ترنزیشن‌ها فقط روی تکه‌های کوچیک ساخته می‌شن
-    (نه یه پاس سنگین روی کل ویدیو و همه‌ی کلیپ‌ها همزمان → رم و زمان کم‌تر). ترنزیشن وسط نقطه‌ی برشِ صدا می‌افته
-    پس طول کل و همگامی با صدا دقیقاً مثل قبل می‌مونه. خروجی: لیست تکه‌ها به ترتیب پخش (برای concat)"""
-    t_start = time.time()
-
-    def left(cap):
-        rem = FX_BUDGET - (time.time() - t_start)
-        if rem < 15:
-            raise TimeoutError(f"fx budget {FX_BUDGET}s exceeded")
-        return min(cap, rem)
-
+def build_video(imgs, nf, out):
+    """کل ویدیو تو یه پاس ffmpeg: هر اسلاید تمام‌صفحه + زوم نرم، بین اسلایدها کراس‌فید کوتاه که دقیقاً وسط نقطه‌ی برشِ صداست؛
+    پس طول هر اسلاید و همگامی با صدا تغییری نمی‌کنه. فقط یه‌بار انکود می‌شه (بدون کلیپ‌های میانی، سریع‌تر از قبل)"""
     n = len(imgs)
     half = 0 if n == 1 else max(1, min(int(round(TRANS_SEC * FPS / 2)), min(nf) // 4))
     d_f = 2 * half
-    tot = sum(nf)
-    ts = tot / FPS
-    tw = VIDEO_W - 2 * BAR_M
-    ticks, acc = "", 0
-    for j in range(n - 1):
-        acc += nf[j]
-        ticks += f",drawbox=x={max(round(tw * acc / tot) - 1, 0)}:y=0:w=3:h={BAR_H}:color=black@0.8:t=fill"
-    body = [nf[i] - (half if i > 0 else 0) - (half if i < n - 1 else 0) for i in range(n)]
-    pieces, prev, pos = [], None, 0          # pos = شروعِ تکه‌ی بعدی در کل ویدیو (فریم)
+    cum = [0]
+    for x in nf:
+        cum.append(cum[-1] + x)
+    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error"]
+    fc = []
     for i, ip in enumerate(imgs):
-        prog(f"🎞 ساخت اسلاید {i + 1} از {n}…")
-        stage(uid, f"render-clip-{i + 1}")
-        t1 = time.time()
-        outs = {k: os.path.join(work, f"p{i}{k}.mp4") for k in "hbt"}
-        head, tail = (d_f if i > 0 else 0), (d_f if i < n - 1 else 0)
-        L = nf[i] + (half if i > 0 else 0) + (half if i < n - 1 else 0)
-        card = os.path.join(work, f"card{i}.png")
-        make_card(ip, card, left(120))
-        if head:
-            make_piece(card, i, L, 0, head, outs["h"], 18, left(120))
-        make_piece(card, i, L, head, L - head - tail, outs["b"], CRF, left(300),
-                   ((pos + head) / FPS, ts, ticks, i == n - 1))
-        if tail:
-            make_piece(card, i, L, L - tail, tail, outs["t"], 18, left(120))
-        os.remove(card)
-        log.info("fx clip %d/%d: %.1fs", i + 1, n, time.time() - t1)
-        if i > 0:
-            prog(f"✨ ترنزیشن {i} از {n - 1}…")
-            stage(uid, f"render-trans-{i}")
-            t1 = time.time()
-            tp = os.path.join(work, f"x{i}.mp4")
-            make_trans(prev, outs["h"], TRANS[(i - 1) % len(TRANS)], d_f, tp, (pos / FPS, ts, ticks), left(120))
-            log.info("fx trans %d/%d: %.1fs", i, n - 1, time.time() - t1)
-            pieces.append(tp)
-            pos += d_f
-        pieces.append(outs["b"])
-        pos += body[i]
-        prev = outs["t"] if tail else None
-    return pieces
+        L = nf[i] + (half if i > 0 else 0) + (half if i < n - 1 else 0)     # هر اسلاید نصف ترنزیشن اضافه، دو طرف
+        cmd += ["-i", ip]
+        fc.append(_slide_chain(i, i, L, f"v{i}"))
+    last = "v0"
+    for i in range(1, n):
+        fc.append(f"[{last}][v{i}]xfade=transition=fade:duration={d_f / FPS:.4f}:offset={(cum[i] - half) / FPS:.4f}[x{i}]")
+        last = f"x{i}"
+    cmd += ["-filter_complex", ";".join(fc), "-map", f"[{last}]", "-frames:v", str(cum[-1]), "-r", str(FPS),
+            "-c:v", "libx264", "-preset", PRESET, "-crf", str(CRF), "-threads", "1", "-pix_fmt", "yuv420p", "-an", out]
+    run(cmd, timeout=FX_BUDGET)
+
 
 
 def mux(clips, voice, t0, dur, out, work, reencode_crf=None):
@@ -577,12 +464,16 @@ def render_job(uid):
             stage(uid, f"render-dl-{i + 1}")
             imgs.append(tg_download(sl["fid"], os.path.join(work, f"s{i}")))
         clips = None
-        if FX_OK:      # انیمیشن حرفه‌ای؛ اگه هر مرحله‌ش خطا داد، خودکار حالت ساده‌ی قبلی اجرا می‌شه
+        if FX_OK:      # کراس‌فید؛ اگه خطا داد، خودکار برش مستقیم (بدون کراس‌فید) ساخته می‌شه
             try:
-                clips = build_fx(uid, imgs, nf, work, prog)
+                prog("🎞 ساخت ویدیو…")
+                stage(uid, "render-video")
+                vo = os.path.join(work, "video.mp4")
+                build_video(imgs, nf, vo)
+                clips = [vo]
             except Exception as e:
-                log.exception("fx render failed; falling back to lite")
-                prog("⚠️ ساخت افکت‌ها خطا داد یا زیادی طول کشید؛ نسخه‌ی ساده ساخته می‌شه…"
+                log.exception("crossfade render failed; falling back to hard cuts")
+                prog("⚠️ ساخت کراس‌فید خطا داد؛ نسخه‌ی ساده ساخته می‌شه…"
                      + (f"\n{str(e)[-300:]}" if DEBUG else ""))
         if clips is None:
             clips = []
