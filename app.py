@@ -4,6 +4,8 @@ Reel Maker — ربات ساخت ریلز اسلایدی با ویس گویند�
 Stack (مثل app-6): Flask + MongoDB(pymongo / mongomock) + وب‌هوک تلگرام
 - کاربر اسلایدها (عکس) رو می‌فرسته، بعد یه ویس کامل از گوینده
 - ویس با ffmpeg silencedetect روی مکث‌ها بین اسلایدها تقسیم می‌شه (یا مساوی)، با دکمه قابل تنظیمه
+- تقسیم مکث‌محورِ حرفه‌ای‌تر: آستانه‌ی سکوت خودکار از روی بلندی صدای خود ویس، انتخاب برش‌ها با DP (مکث‌های قوی + طول متعادل)
+  و گذاشتن برش درست قبل از شروع جمله‌ی بعدی (بدون هیچ API یا سرویس بیرونی)
 - خروجی: ویدیوی ۹:۱۶ با پس‌زمینه‌ی بلور، زوم/پن ملایم، فید بین اسلایدها و صدای نرمال‌شده
 - ساخت ویدیو در یه صف تک‌نفره (مناسب پلن رایگان Render: رم کم / CPU ضعیف)
 اجرا: gunicorn app:app -w 1 --threads 4 -t 120   (حتما یک worker، چون صف داخل حافظه‌ست)
@@ -30,8 +32,8 @@ VIDEO_H     = int(os.environ.get("VIDEO_H", "1280"))
 FPS         = int(os.environ.get("FPS", "25"))
 PRESET      = os.environ.get("X264_PRESET", "ultrafast")
 CRF         = int(os.environ.get("CRF", "27"))
-SIL_DB      = os.environ.get("SIL_DB", "-32dB")             # آستانه‌ی سکوت
-SIL_MIN     = float(os.environ.get("SIL_MIN", "0.3"))       # حداقل طول مکث (ثانیه)
+SIL_DB      = os.environ.get("SIL_DB", "auto")              # آستانه‌ی سکوت؛ auto = از روی بلندی خود ویس حساب می‌شه
+SIL_MIN     = float(os.environ.get("SIL_MIN", "0.18"))      # حداقل طول مکث (ثانیه)؛ مکث‌های کوتاه هم دیده می‌شن، قدرتشون در DP سنجیده می‌شه
 DEBUG       = os.environ.get("DEBUG", "") == "1"            # علت دقیق خطا رو برای کاربر نشون می‌ده
 MIN_SEG     = 1.0    # حداقل طول هر اسلاید در تقسیم خودکار
 MIN_ADJ     = 0.5    # حداقل طول هر اسلاید موقع تنظیم دستی
@@ -192,7 +194,76 @@ def cuts_equal(n, t0, t1):
     return [round(t0 + (t1 - t0) * i / n, 2) for i in range(1, n)]
 
 
+def auto_noise(vp):
+    """آستانه‌ی سکوت رو از روی بلندی میانگین خود ویس حساب می‌کنه (ویس بلند/آروم یا نویزدار هم درست جواب بده)"""
+    if SIL_DB != "auto":
+        return SIL_DB
+    try:
+        err = run([FFMPEG, "-hide_banner", "-nostats", "-i", vp, "-vn", "-af", "volumedetect", "-f", "null", "-"], timeout=120)
+        m = re.search(r"mean_volume:\s*(-?[\d.]+)\s*dB", err)
+        if m:
+            return f"{min(max(float(m[1]) - 14, -46), -28):.0f}dB"
+    except Exception:
+        log.warning("volumedetect failed")
+    return "-34dB"
+
+
+def cut_point(st, en):
+    """نقطه‌ی برش داخل مکث: تا آخرِ مکث نزدیک می‌شه (اسلاید جدید درست قبل از شروع حرف بعدی میاد) ولی از وسط مکث عقب‌تر نمی‌ره"""
+    return max((st + en) / 2, en - 0.25)
+
+
+def cuts_dp(sil, n, t0, t1):
+    """بهترین N-1 برش از بین همه‌ی مکث‌ها با برنامه‌ریزی پویا:
+    مکث‌های قوی‌تر (بلندتر) امتیاز می‌گیرن، و طول‌های خیلی نامتعادل جریمه می‌شن. اگه شدنی نبود None"""
+    if n <= 1:
+        return [], 0
+    cand = []
+    for st, en, du in sil:
+        c = cut_point(st, en)
+        if t0 + MIN_SEG <= c <= t1 - MIN_SEG:
+            cand.append((c, min(du, 1.2)))
+    cand.sort()
+    m, k_need = len(cand), n - 1
+    if m < k_need:
+        return None
+    tgt = (t1 - t0) / n
+    pen = lambda d: 0.8 * ((d - tgt) / tgt) ** 2
+    NEG = -1e18
+    dp = [[NEG] * m for _ in range(k_need + 1)]
+    par = [[-1] * m for _ in range(k_need + 1)]
+    for j in range(m):
+        if cand[j][0] - t0 >= MIN_SEG:
+            dp[1][j] = 2.0 * cand[j][1] - pen(cand[j][0] - t0)
+    for k in range(2, k_need + 1):
+        for j in range(m):
+            for i in range(j):
+                if dp[k - 1][i] <= NEG or cand[j][0] - cand[i][0] < MIN_SEG:
+                    continue
+                v = dp[k - 1][i] + 2.0 * cand[j][1] - pen(cand[j][0] - cand[i][0])
+                if v > dp[k][j]:
+                    dp[k][j], par[k][j] = v, i
+    best, bj = NEG, -1
+    for j in range(m):
+        if dp[k_need][j] > NEG and t1 - cand[j][0] >= MIN_SEG:
+            v = dp[k_need][j] - pen(t1 - cand[j][0])
+            if v > best:
+                best, bj = v, j
+    if bj < 0:
+        return None
+    out, j = [], bj
+    for k in range(k_need, 0, -1):
+        out.append(round(cand[j][0], 2))
+        j = par[k][j]
+    return out[::-1], k_need
+
+
 def cuts_pause(sil, n, t0, t1):
+    r = cuts_dp(sil, n, t0, t1)
+    return r if r else cuts_greedy(sil, n, t0, t1)
+
+
+def cuts_greedy(sil, n, t0, t1):
     """N-1 تا از بلندترین مکث‌ها؛ اگه کم بود، بقیه از وسط بلندترین بخش‌ها. خروجی: (برش‌ها، تعداد مکث واقعی)"""
     cuts = []
     for st, en, du in sorted(sil, key=lambda x: -x[2]):
@@ -287,8 +358,10 @@ def analyze_job(uid):
         vp = tg_download(s["voice"]["fid"], os.path.join(work, "voice"))
         log.info("analyze: downloaded %s bytes", os.path.getsize(vp))
         stage(uid, "ffmpeg-silencedetect")
+        noise = auto_noise(vp)
+        log.info("silence threshold: %s", noise)
         err = run([FFMPEG, "-hide_banner", "-nostats", "-i", vp, "-vn",
-                   "-af", f"silencedetect=noise={SIL_DB}:d={SIL_MIN}", "-f", "null", "-"], timeout=120)
+                   "-af", f"silencedetect=noise={noise}:d={SIL_MIN}", "-f", "null", "-"], timeout=120)
         dur, sil = parse_silence(err)
         dur = dur or float(s["voice"].get("dur") or 0)
         if dur <= 0:
