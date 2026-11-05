@@ -322,7 +322,31 @@ def make_clip(img, out, n, idx):
          "-threads", "1", "-pix_fmt", "yuv420p", "-an", out], timeout=240)
 
 
-def build_video(imgs, nf, out):
+def run_live(cmd, total, on_frame, timeout):
+    """اجرای ffmpeg با گزارش زنده‌ی پیشرفت (شماره‌ی فریمِ در حال ساخت) تا بشه به کاربر نشون داد کدوم اسلاید در حال ساخته شدنه"""
+    t0 = time.time()
+    with tempfile.TemporaryFile() as errf:
+        p = subprocess.Popen(cmd[:1] + ["-progress", "pipe:1", "-nostats"] + cmd[1:], stdout=subprocess.PIPE, stderr=errf,
+                             stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace")
+        try:
+            for line in p.stdout:
+                if time.time() - t0 > timeout:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                if line.startswith("frame="):
+                    try:
+                        on_frame(min(int(line[6:].strip()), total))
+                    except ValueError:
+                        pass
+            p.wait(timeout=30)
+        except BaseException:
+            p.kill()
+            raise
+        if p.returncode != 0:
+            errf.seek(0)
+            raise RuntimeError(errf.read().decode("utf-8", "replace")[-700:])
+
+
+def build_video(imgs, nf, out, prog=None):
     """کل ویدیو تو یه پاس ffmpeg: هر اسلاید تمام‌صفحه + زوم نرم، بین اسلایدها کراس‌فید کوتاه که دقیقاً وسط نقطه‌ی برشِ صداست؛
     پس طول هر اسلاید و همگامی با صدا تغییری نمی‌کنه. فقط یه‌بار انکود می‌شه (بدون کلیپ‌های میانی، سریع‌تر از قبل)"""
     n = len(imgs)
@@ -343,7 +367,33 @@ def build_video(imgs, nf, out):
         last = f"x{i}"
     cmd += ["-filter_complex", ";".join(fc), "-map", f"[{last}]", "-frames:v", str(cum[-1]), "-r", str(FPS),
             "-c:v", "libx264", "-preset", PRESET, "-crf", str(CRF), "-threads", "1", "-pix_fmt", "yuv420p", "-an", out]
-    run(cmd, timeout=FX_BUDGET)
+    if prog is None:
+        return run(cmd, timeout=FX_BUDGET)
+    n_tr = n - 1
+    state = {"txt": "", "t": 0.0}
+
+    def on_frame(f):
+        f = min(f, cum[-1])
+        if n > 1 and f < cum[-1]:
+            tr = next((i for i in range(1, n) if cum[i] - half <= f < cum[i] + half), 0)
+        else:
+            tr = 0
+        i = next((k for k in range(n) if f < cum[k + 1]), n - 1)
+        pct = int(f * 100 / max(cum[-1], 1))
+        bar = "▰" * (pct // 10) + "▱" * (10 - pct // 10)
+        if tr:
+            txt = f"✨ ترنزیشن {tr} از {n_tr}…\n{bar} {pct}٪"
+        else:
+            txt = f"🎞 ساخت اسلاید {i + 1} از {n}…\n{bar} {pct}٪"
+        if txt != state["txt"] and time.time() - state["t"] >= 2.5:     # محدودیت ویرایش پیام تلگرام
+            state["txt"], state["t"] = txt, time.time()
+            try:
+                prog(txt)
+            except Exception:
+                pass
+
+    prog(f"🎞 ساخت اسلاید 1 از {n}…\n▱▱▱▱▱▱▱▱▱▱ 0٪")
+    run_live(cmd, cum[-1], on_frame, FX_BUDGET)
 
 
 
@@ -466,10 +516,9 @@ def render_job(uid):
         clips = None
         if FX_OK:      # کراس‌فید؛ اگه خطا داد، خودکار برش مستقیم (بدون کراس‌فید) ساخته می‌شه
             try:
-                prog("🎞 ساخت ویدیو…")
                 stage(uid, "render-video")
                 vo = os.path.join(work, "video.mp4")
-                build_video(imgs, nf, vo)
+                build_video(imgs, nf, vo, prog)
                 clips = [vo]
             except Exception as e:
                 log.exception("crossfade render failed; falling back to hard cuts")
