@@ -39,6 +39,7 @@ SIL_MIN     = float(os.environ.get("SIL_MIN", "0.18"))      # حداقل طول 
 DEBUG       = os.environ.get("DEBUG", "") == "1"            # علت دقیق خطا رو برای کاربر نشون می‌ده
 FX_MODE     = os.environ.get("FX", "pro").strip().lower()   # pro = انیمیشن کامل | lite = ساده و سریع (مثل قبل)
 TRANS_SEC   = float(os.environ.get("TRANS_SEC", "0.32"))    # طول ترنزیشن بین اسلایدها (ثانیه)
+FX_BUDGET   = int(os.environ.get("FX_BUDGET", "480"))       # بیشترین زمان مجاز برای ساخت افکت‌ها (ثانیه)؛ بیشتر شد، خودکار نسخه‌ی ساده ساخته می‌شه
 MIN_SEG     = 1.0    # حداقل طول هر اسلاید در تقسیم خودکار
 MIN_ADJ     = 0.5    # حداقل طول هر اسلاید موقع تنظیم دستی
 BUSY        = ("analyzing", "queued", "rendering")
@@ -326,14 +327,32 @@ TRANS = ["fade", "smoothleft", "fade", "smoothup", "smoothright"]   # ترتیب
 BAR_M, BAR_Y, BAR_H = 36, 44, 6                                    # حاشیه، فاصله از بالا و ضخامت نوار پیشرفت
 
 
-def make_clip_fx(img, out, n, idx):
-    """یه اسلاید → کلیپ: پس‌زمینه‌ی بلور + کارت گوشه‌گرد با سایه + زوم/پن با شتاب نرم (بدون فید؛ ترنزیشن بعداً می‌آد)"""
+def make_card(img, png, timeout):
+    """ترکیب ثابت یه اسلاید (فقط یک فریم): پس‌زمینه‌ی بلور + کارت گوشه‌گرد با سایه → PNG. این کار برای هر اسلاید فقط یک‌بار انجام می‌شه"""
     W, H = VIDEO_W, VIDEO_H
     S = 1.5                                            # ترکیب در سایز بزرگ‌تر تا زوم نلرزه
     bw, bh = int(W * S) // 2 * 2, int(H * S) // 2 * 2
     cw, ch = int(bw * 0.90), int(bh * 0.80)            # بیشترین اندازه‌ی کارت
     R, P = int(26 * S), int(22 * S)                    # شعاع گوشه، پدینگ سایه
-    pr = f"(on/{n})"
+    alpha = (f"if(gt(abs(W/2-X),W/2-{R})*gt(abs(H/2-Y),H/2-{R}),"
+             f"255*clip({R}-hypot(abs(W/2-X)-(W/2-{R}),abs(H/2-Y)-(H/2-{R}))+0.5,0,1),255)")
+    fc = (f"[0:v]split[a][b];"
+          f"[a]scale={bw}:{bh}:force_original_aspect_ratio=increase,crop={bw}:{bh},boxblur=30:3,"
+          f"eq=brightness=-0.10:saturation=1.15[bg];"
+          f"[b]scale={cw}:{ch}:force_original_aspect_ratio=decrease,format=rgba,"
+          f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{alpha}',split[c1][c2];"
+          f"[c2]colorchannelmixer=rr=0:gg=0:bb=0:aa=0.6,pad=iw+{2 * P}:ih+{2 * P}:{P}:{P}:color=black@0,"
+          f"boxblur={P // 2}:2[sh];"
+          f"[bg][sh]overlay=x=(W-w)/2:y=(H-h)/2+{int(12 * S)}:format=auto[t1];"
+          f"[t1][c1]overlay=x=(W-w)/2:y=(H-h)/2:format=auto,format=rgb24[v0]")
+    run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", img, "-filter_complex", fc, "-map", "[v0]",
+         "-frames:v", "1", png], timeout=timeout)
+
+
+def _motion(L, idx, off, frames):
+    """حرکت دوربین (زوم/پن با شتاب نرم) برای فریم‌های off..off+frames از کلیپ L فریمی"""
+    W, H = VIDEO_W, VIDEO_H
+    pr = f"((on+{off})/{L})"
     e = f"({pr}*{pr}*(3-2*{pr}))"                       # smoothstep: شروع و پایان نرم
     zi, y = 0.09, "ih/2-(ih/zoom/2)"
     m = idx % 4
@@ -345,63 +364,100 @@ def make_clip_fx(img, out, n, idx):
         z, x = "1.08", f"(iw-iw/zoom)*{e}"
     else:
         z, x = "1.08", f"(iw-iw/zoom)*(1-{e})"
-    alpha = (f"if(gt(abs(W/2-X),W/2-{R})*gt(abs(H/2-Y),H/2-{R}),"
-             f"255*clip({R}-hypot(abs(W/2-X)-(W/2-{R}),abs(H/2-Y)-(H/2-{R}))+0.5,0,1),255)")
-    fc = (f"[0:v]split[a][b];"
-          f"[a]scale={bw}:{bh}:force_original_aspect_ratio=increase,crop={bw}:{bh},boxblur=30:3,"
-          f"eq=brightness=-0.10:saturation=1.15[bg];"
-          f"[b]scale={cw}:{ch}:force_original_aspect_ratio=decrease,format=rgba,"
-          f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{alpha}',split[c1][c2];"
-          f"[c2]colorchannelmixer=rr=0:gg=0:bb=0:aa=0.6,pad=iw+{2 * P}:ih+{2 * P}:{P}:{P}:color=black@0,"
-          f"boxblur={P // 2}:2[sh];"
-          f"[bg][sh]overlay=x=(W-w)/2:y=(H-h)/2+{int(12 * S)}:format=auto[t1];"
-          f"[t1][c1]overlay=x=(W-w)/2:y=(H-h)/2:format=auto,"
-          f"zoompan=z='{z}':x='{x}':y='{y}':d={n}:s={W}x{H}:fps={FPS},format=yuv420p[v]")
-    run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", img, "-filter_complex", fc, "-map", "[v]",
-         "-frames:v", str(n), "-r", str(FPS), "-c:v", "libx264", "-preset", PRESET, "-crf", str(max(CRF - 6, 18)),
-         "-threads", "1", "-pix_fmt", "yuv420p", "-an", out], timeout=300)
+    return f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps={FPS},format=yuv420p"
+
+
+def _bar(src, dst, dur, off, ts, ticks, fade_out=False):
+    """نوار پیشرفت: dur = طول این تکه، off = شروع این تکه در کل ویدیو، ts = طول کل ویدیو (ثانیه)"""
+    tw = VIDEO_W - 2 * BAR_M
+    fd = f",fade=t=out:st={max(dur - 0.3, 0):.3f}:d=0.3" if fade_out else ""
+    return [f"color=c=0x8a8a8a:s={tw}x{BAR_H}:r={FPS}:d={dur:.3f}[trk]",
+            f"color=c=white:s={tw}x{BAR_H}:r={FPS}:d={dur:.3f}[fil]",
+            f"[trk][fil]overlay=x='-{tw}+{tw}*min((t+{off:.4f})/{ts:.3f},1)':y=0{ticks},"
+            f"format=rgba,colorchannelmixer=aa=0.9[bar]",
+            f"{src}[bar]overlay=x={BAR_M}:y={BAR_Y}:format=auto:shortest=1{fd},format=yuv420p[{dst}]"]
+
+
+def _enc(crf, frames):
+    return ["-r", str(FPS), "-frames:v", str(frames), "-c:v", "libx264", "-preset", PRESET, "-crf", str(crf),
+            "-threads", "1", "-pix_fmt", "yuv420p", "-an"]
+
+
+def make_piece(png, idx, L, off, frames, out, crf, timeout, bar=None):
+    """یه تکه از حرکتِ اسلاید (فریم‌های off تا off+frames از L) → ویدیو. bar = (شروع در کل ویدیو، طول کل، تیک‌ها، آخری؟)"""
+    fc = [f"[0:v]{_motion(L, idx, off, frames)}[v0]"]
+    lab = "[v0]"
+    if bar:
+        boff, ts, ticks, last = bar
+        fc += _bar("[v0]", "bo", frames / FPS, boff, ts, ticks, last)
+        lab = "[bo]"
+    run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", png, "-filter_complex", ";".join(fc),
+         "-map", lab] + _enc(crf, frames) + [out], timeout=timeout)
+
+
+def make_trans(tail_p, head_p, tr, d_f, out, bar, timeout):
+    """ترنزیشن بین دو اسلاید: فقط روی ~۰.۳ ثانیه (چند فریم) کار می‌کنه، نه کل ویدیو"""
+    off, ts, ticks = bar
+    fc = [f"[0:v][1:v]xfade=transition={tr}:duration={d_f / FPS:.4f}:offset=0[xf]"]
+    fc += _bar("[xf]", "vo", d_f / FPS, off, ts, ticks)
+    run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", tail_p, "-i", head_p,
+         "-filter_complex", ";".join(fc), "-map", "[vo]"] + _enc(CRF, d_f) + [out], timeout=timeout)
 
 
 def build_fx(uid, imgs, nf, work, prog):
-    """کلیپ‌ها رو با ترنزیشن (xfade) به هم وصل می‌کنه و نوار پیشرفت اضافه می‌کنه. ترنزیشن وسط نقطه‌ی برشِ صدا می‌افته
-    پس طول کل ویدیو و همگامی با صدا دقیقاً مثل قبل می‌مونه. خروجی: مسیر یه فایل ویدیویی"""
-    n, W = len(imgs), VIDEO_W
+    """هر اسلاید یک‌بار رندر می‌شه و به تکه‌های (بدنه + سر/دم ترنزیشن) شکسته می‌شه؛ ترنزیشن‌ها فقط روی تکه‌های کوچیک ساخته می‌شن
+    (نه یه پاس سنگین روی کل ویدیو و همه‌ی کلیپ‌ها همزمان → رم و زمان کم‌تر). ترنزیشن وسط نقطه‌ی برشِ صدا می‌افته
+    پس طول کل و همگامی با صدا دقیقاً مثل قبل می‌مونه. خروجی: لیست تکه‌ها به ترتیب پخش (برای concat)"""
+    t_start = time.time()
+
+    def left(cap):
+        rem = FX_BUDGET - (time.time() - t_start)
+        if rem < 15:
+            raise TimeoutError(f"fx budget {FX_BUDGET}s exceeded")
+        return min(cap, rem)
+
+    n = len(imgs)
     half = 0 if n == 1 else max(1, min(int(round(TRANS_SEC * FPS / 2)), min(nf) // 4))
-    L = [nf[i] + (half if i > 0 else 0) + (half if i < n - 1 else 0) for i in range(n)]
-    clips = []
-    for i, ip in enumerate(imgs):
-        prog(f"🎞 ساخت اسلاید {i + 1} از {n}…")
-        stage(uid, f"render-clip-{i + 1}")
-        cp = os.path.join(work, f"c{i}.mp4")
-        make_clip_fx(ip, cp, L[i], i)
-        clips.append(cp)
-    prog("✨ افکت‌ها و ترنزیشن…")
-    stage(uid, "render-fx")
+    d_f = 2 * half
     tot = sum(nf)
     ts = tot / FPS
-    fc, cur, cum = [], "[0:v]", L[0]
-    for j in range(1, n):
-        fc.append(f"{cur}[{j}:v]xfade=transition={TRANS[(j - 1) % len(TRANS)]}:duration={2 * half / FPS:.4f}:"
-                  f"offset={(cum - 2 * half) / FPS:.4f}[x{j}]")
-        cur, cum = f"[x{j}]", cum + L[j] - 2 * half
-    tw = W - 2 * BAR_M
+    tw = VIDEO_W - 2 * BAR_M
     ticks, acc = "", 0
     for j in range(n - 1):
         acc += nf[j]
         ticks += f",drawbox=x={max(round(tw * acc / tot) - 1, 0)}:y=0:w=3:h={BAR_H}:color=black@0.8:t=fill"
-    fc.append(f"color=c=0x8a8a8a:s={tw}x{BAR_H}:r={FPS}:d={ts:.3f}[trk]")
-    fc.append(f"color=c=white:s={tw}x{BAR_H}:r={FPS}:d={ts:.3f}[fil]")
-    fc.append(f"[trk][fil]overlay=x='-{tw}+{tw}*min(t/{ts:.3f},1)':y=0{ticks},format=rgba,colorchannelmixer=aa=0.9[bar]")
-    fc.append(f"{cur}[bar]overlay=x={BAR_M}:y={BAR_Y}:format=auto:shortest=1,"
-              f"fade=t=out:st={max(ts - 0.3, 0):.3f}:d=0.3,format=yuv420p[v]")
-    out = os.path.join(work, "fx.mp4")
-    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error"]
-    for c in clips:
-        cmd += ["-i", c]
-    cmd += ["-filter_complex", ";".join(fc), "-map", "[v]", "-frames:v", str(tot), "-r", str(FPS),
-            "-c:v", "libx264", "-preset", PRESET, "-crf", str(CRF), "-threads", "1", "-pix_fmt", "yuv420p", "-an", out]
-    run(cmd, timeout=600)
-    return out
+    body = [nf[i] - (half if i > 0 else 0) - (half if i < n - 1 else 0) for i in range(n)]
+    pieces, prev, pos = [], None, 0          # pos = شروعِ تکه‌ی بعدی در کل ویدیو (فریم)
+    for i, ip in enumerate(imgs):
+        prog(f"🎞 ساخت اسلاید {i + 1} از {n}…")
+        stage(uid, f"render-clip-{i + 1}")
+        t1 = time.time()
+        outs = {k: os.path.join(work, f"p{i}{k}.mp4") for k in "hbt"}
+        head, tail = (d_f if i > 0 else 0), (d_f if i < n - 1 else 0)
+        L = nf[i] + (half if i > 0 else 0) + (half if i < n - 1 else 0)
+        card = os.path.join(work, f"card{i}.png")
+        make_card(ip, card, left(120))
+        if head:
+            make_piece(card, i, L, 0, head, outs["h"], 18, left(120))
+        make_piece(card, i, L, head, L - head - tail, outs["b"], CRF, left(300),
+                   ((pos + head) / FPS, ts, ticks, i == n - 1))
+        if tail:
+            make_piece(card, i, L, L - tail, tail, outs["t"], 18, left(120))
+        os.remove(card)
+        log.info("fx clip %d/%d: %.1fs", i + 1, n, time.time() - t1)
+        if i > 0:
+            prog(f"✨ ترنزیشن {i} از {n - 1}…")
+            stage(uid, f"render-trans-{i}")
+            t1 = time.time()
+            tp = os.path.join(work, f"x{i}.mp4")
+            make_trans(prev, outs["h"], TRANS[(i - 1) % len(TRANS)], d_f, tp, (pos / FPS, ts, ticks), left(120))
+            log.info("fx trans %d/%d: %.1fs", i, n - 1, time.time() - t1)
+            pieces.append(tp)
+            pos += d_f
+        pieces.append(outs["b"])
+        pos += body[i]
+        prev = outs["t"] if tail else None
+    return pieces
 
 
 def mux(clips, voice, t0, dur, out, work, reencode_crf=None):
@@ -523,11 +579,11 @@ def render_job(uid):
         clips = None
         if FX_OK:      # انیمیشن حرفه‌ای؛ اگه هر مرحله‌ش خطا داد، خودکار حالت ساده‌ی قبلی اجرا می‌شه
             try:
-                clips = [build_fx(uid, imgs, nf, work, prog)]
+                clips = build_fx(uid, imgs, nf, work, prog)
             except Exception as e:
                 log.exception("fx render failed; falling back to lite")
-                if DEBUG:
-                    prog(f"⚠️ حالت حرفه‌ای خطا داد، حالت ساده اجرا می‌شه…\n{str(e)[-300:]}")
+                prog("⚠️ ساخت افکت‌ها خطا داد یا زیادی طول کشید؛ نسخه‌ی ساده ساخته می‌شه…"
+                     + (f"\n{str(e)[-300:]}" if DEBUG else ""))
         if clips is None:
             clips = []
             for i, ip in enumerate(imgs):
