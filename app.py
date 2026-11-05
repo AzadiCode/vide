@@ -6,6 +6,8 @@ Stack (مثل app-6): Flask + MongoDB(pymongo / mongomock) + وب‌هوک تل�
 - ویس با ffmpeg silencedetect روی مکث‌ها بین اسلایدها تقسیم می‌شه (یا مساوی)، با دکمه قابل تنظیمه
 - تقسیم مکث‌محورِ حرفه‌ای‌تر: آستانه‌ی سکوت خودکار از روی بلندی صدای خود ویس، انتخاب برش‌ها با DP (مکث‌های قوی + طول متعادل)
   و گذاشتن برش درست قبل از شروع جمله‌ی بعدی (بدون هیچ API یا سرویس بیرونی)
+- انیمیشن حرفه‌ای (FX=pro): ترنزیشن واقعی بین اسلایدها (کراس‌فید/اسلاید نرم، وسط برشِ صدا)، زوم/پن با شتاب نرم (ease)،
+  کارت گوشه‌گرد با سایه روی پس‌زمینه‌ی بلور، و نوار پیشرفت بالای ویدیو. اگه ffmpeg ترنزیشن نداشت یا خطا داد، خودکار حالت ساده (FX=lite) اجرا می‌شه
 - خروجی: ویدیوی ۹:۱۶ با پس‌زمینه‌ی بلور، زوم/پن ملایم، فید بین اسلایدها و صدای نرمال‌شده
 - ساخت ویدیو در یه صف تک‌نفره (مناسب پلن رایگان Render: رم کم / CPU ضعیف)
 اجرا: gunicorn app:app -w 1 --threads 4 -t 120   (حتما یک worker، چون صف داخل حافظه‌ست)
@@ -35,6 +37,8 @@ CRF         = int(os.environ.get("CRF", "27"))
 SIL_DB      = os.environ.get("SIL_DB", "auto")              # آستانه‌ی سکوت؛ auto = از روی بلندی خود ویس حساب می‌شه
 SIL_MIN     = float(os.environ.get("SIL_MIN", "0.18"))      # حداقل طول مکث (ثانیه)؛ مکث‌های کوتاه هم دیده می‌شن، قدرتشون در DP سنجیده می‌شه
 DEBUG       = os.environ.get("DEBUG", "") == "1"            # علت دقیق خطا رو برای کاربر نشون می‌ده
+FX_MODE     = os.environ.get("FX", "pro").strip().lower()   # pro = انیمیشن کامل | lite = ساده و سریع (مثل قبل)
+TRANS_SEC   = float(os.environ.get("TRANS_SEC", "0.32"))    # طول ترنزیشن بین اسلایدها (ثانیه)
 MIN_SEG     = 1.0    # حداقل طول هر اسلاید در تقسیم خودکار
 MIN_ADJ     = 0.5    # حداقل طول هر اسلاید موقع تنظیم دستی
 BUSY        = ("analyzing", "queued", "rendering")
@@ -76,6 +80,19 @@ try:
 except Exception as _e:
     FFVER = f"ERROR: {_e}"
 log.info("ffmpeg: %s -> %s", FFMPEG, FFVER)
+
+
+def _has_filter(name):
+    try:
+        out = subprocess.run([FFMPEG, "-hide_banner", "-filters"], capture_output=True, text=True, timeout=20,
+                             stdin=subprocess.DEVNULL).stdout
+        return re.search(rf"\s{name}\s", out) is not None
+    except Exception:
+        return False
+
+
+FX_OK = FX_MODE != "lite" and _has_filter("xfade")
+log.info("fx: mode=%s xfade=%s", FX_MODE, FX_OK)
 
 
 # ───────────────────────── ابزارهای تلگرام ─────────────────────────
@@ -304,6 +321,89 @@ def make_clip(img, out, n, idx):
          "-threads", "1", "-pix_fmt", "yuv420p", "-an", out], timeout=240)
 
 
+# ───────────────────── انیمیشن حرفه‌ای (FX=pro) ─────────────────────
+TRANS = ["fade", "smoothleft", "fade", "smoothup", "smoothright"]   # ترتیب ترنزیشن‌ها؛ آروم و تمیز
+BAR_M, BAR_Y, BAR_H = 36, 44, 6                                    # حاشیه، فاصله از بالا و ضخامت نوار پیشرفت
+
+
+def make_clip_fx(img, out, n, idx):
+    """یه اسلاید → کلیپ: پس‌زمینه‌ی بلور + کارت گوشه‌گرد با سایه + زوم/پن با شتاب نرم (بدون فید؛ ترنزیشن بعداً می‌آد)"""
+    W, H = VIDEO_W, VIDEO_H
+    S = 1.5                                            # ترکیب در سایز بزرگ‌تر تا زوم نلرزه
+    bw, bh = int(W * S) // 2 * 2, int(H * S) // 2 * 2
+    cw, ch = int(bw * 0.90), int(bh * 0.80)            # بیشترین اندازه‌ی کارت
+    R, P = int(26 * S), int(22 * S)                    # شعاع گوشه، پدینگ سایه
+    pr = f"(on/{n})"
+    e = f"({pr}*{pr}*(3-2*{pr}))"                       # smoothstep: شروع و پایان نرم
+    zi, y = 0.09, "ih/2-(ih/zoom/2)"
+    m = idx % 4
+    if m == 0:
+        z, x = f"1+{zi}*{e}", "iw/2-(iw/zoom/2)"
+    elif m == 1:
+        z, x = f"1+{zi}-{zi}*{e}", "iw/2-(iw/zoom/2)"
+    elif m == 2:
+        z, x = "1.08", f"(iw-iw/zoom)*{e}"
+    else:
+        z, x = "1.08", f"(iw-iw/zoom)*(1-{e})"
+    alpha = (f"if(gt(abs(W/2-X),W/2-{R})*gt(abs(H/2-Y),H/2-{R}),"
+             f"255*clip({R}-hypot(abs(W/2-X)-(W/2-{R}),abs(H/2-Y)-(H/2-{R}))+0.5,0,1),255)")
+    fc = (f"[0:v]split[a][b];"
+          f"[a]scale={bw}:{bh}:force_original_aspect_ratio=increase,crop={bw}:{bh},boxblur=30:3,"
+          f"eq=brightness=-0.10:saturation=1.15[bg];"
+          f"[b]scale={cw}:{ch}:force_original_aspect_ratio=decrease,format=rgba,"
+          f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{alpha}',split[c1][c2];"
+          f"[c2]colorchannelmixer=rr=0:gg=0:bb=0:aa=0.6,pad=iw+{2 * P}:ih+{2 * P}:{P}:{P}:color=black@0,"
+          f"boxblur={P // 2}:2[sh];"
+          f"[bg][sh]overlay=x=(W-w)/2:y=(H-h)/2+{int(12 * S)}:format=auto[t1];"
+          f"[t1][c1]overlay=x=(W-w)/2:y=(H-h)/2:format=auto,"
+          f"zoompan=z='{z}':x='{x}':y='{y}':d={n}:s={W}x{H}:fps={FPS},format=yuv420p[v]")
+    run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", img, "-filter_complex", fc, "-map", "[v]",
+         "-frames:v", str(n), "-r", str(FPS), "-c:v", "libx264", "-preset", PRESET, "-crf", str(max(CRF - 6, 18)),
+         "-threads", "1", "-pix_fmt", "yuv420p", "-an", out], timeout=300)
+
+
+def build_fx(uid, imgs, nf, work, prog):
+    """کلیپ‌ها رو با ترنزیشن (xfade) به هم وصل می‌کنه و نوار پیشرفت اضافه می‌کنه. ترنزیشن وسط نقطه‌ی برشِ صدا می‌افته
+    پس طول کل ویدیو و همگامی با صدا دقیقاً مثل قبل می‌مونه. خروجی: مسیر یه فایل ویدیویی"""
+    n, W = len(imgs), VIDEO_W
+    half = 0 if n == 1 else max(1, min(int(round(TRANS_SEC * FPS / 2)), min(nf) // 4))
+    L = [nf[i] + (half if i > 0 else 0) + (half if i < n - 1 else 0) for i in range(n)]
+    clips = []
+    for i, ip in enumerate(imgs):
+        prog(f"🎞 ساخت اسلاید {i + 1} از {n}…")
+        stage(uid, f"render-clip-{i + 1}")
+        cp = os.path.join(work, f"c{i}.mp4")
+        make_clip_fx(ip, cp, L[i], i)
+        clips.append(cp)
+    prog("✨ افکت‌ها و ترنزیشن…")
+    stage(uid, "render-fx")
+    tot = sum(nf)
+    ts = tot / FPS
+    fc, cur, cum = [], "[0:v]", L[0]
+    for j in range(1, n):
+        fc.append(f"{cur}[{j}:v]xfade=transition={TRANS[(j - 1) % len(TRANS)]}:duration={2 * half / FPS:.4f}:"
+                  f"offset={(cum - 2 * half) / FPS:.4f}[x{j}]")
+        cur, cum = f"[x{j}]", cum + L[j] - 2 * half
+    tw = W - 2 * BAR_M
+    ticks, acc = "", 0
+    for j in range(n - 1):
+        acc += nf[j]
+        ticks += f",drawbox=x={max(round(tw * acc / tot) - 1, 0)}:y=0:w=3:h={BAR_H}:color=black@0.8:t=fill"
+    fc.append(f"color=c=0x8a8a8a:s={tw}x{BAR_H}:r={FPS}:d={ts:.3f}[trk]")
+    fc.append(f"color=c=white:s={tw}x{BAR_H}:r={FPS}:d={ts:.3f}[fil]")
+    fc.append(f"[trk][fil]overlay=x='-{tw}+{tw}*min(t/{ts:.3f},1)':y=0{ticks},format=rgba,colorchannelmixer=aa=0.9[bar]")
+    fc.append(f"{cur}[bar]overlay=x={BAR_M}:y={BAR_Y}:format=auto:shortest=1,"
+              f"fade=t=out:st={max(ts - 0.3, 0):.3f}:d=0.3,format=yuv420p[v]")
+    out = os.path.join(work, "fx.mp4")
+    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error"]
+    for c in clips:
+        cmd += ["-i", c]
+    cmd += ["-filter_complex", ";".join(fc), "-map", "[v]", "-frames:v", str(tot), "-r", str(FPS),
+            "-c:v", "libx264", "-preset", PRESET, "-crf", str(CRF), "-threads", "1", "-pix_fmt", "yuv420p", "-an", out]
+    run(cmd, timeout=600)
+    return out
+
+
 def mux(clips, voice, t0, dur, out, work, reencode_crf=None):
     lst = os.path.join(work, "list.txt")
     with open(lst, "w") as f:
@@ -414,15 +514,28 @@ def render_job(uid):
         prog("⬇️ دریافت ویس…")
         stage(uid, "render-download")
         vp = tg_download(s["voice"]["fid"], os.path.join(work, "voice"))
-        clips = []
+        nf = [max(fr[i + 1] - fr[i], 2) for i in range(n)]
+        imgs = []
         for i, sl in enumerate(slides):
-            prog(f"🎞 ساخت اسلاید {i + 1} از {n}…")
-            stage(uid, f"render-clip-{i + 1}")
-            ip = tg_download(sl["fid"], os.path.join(work, f"s{i}"))
-            cp = os.path.join(work, f"c{i}.mp4")
-            make_clip(ip, cp, max(fr[i + 1] - fr[i], 2), i)
-            os.remove(ip)
-            clips.append(cp)
+            prog(f"📥 دریافت اسلاید {i + 1} از {n}…")
+            stage(uid, f"render-dl-{i + 1}")
+            imgs.append(tg_download(sl["fid"], os.path.join(work, f"s{i}")))
+        clips = None
+        if FX_OK:      # انیمیشن حرفه‌ای؛ اگه هر مرحله‌ش خطا داد، خودکار حالت ساده‌ی قبلی اجرا می‌شه
+            try:
+                clips = [build_fx(uid, imgs, nf, work, prog)]
+            except Exception as e:
+                log.exception("fx render failed; falling back to lite")
+                if DEBUG:
+                    prog(f"⚠️ حالت حرفه‌ای خطا داد، حالت ساده اجرا می‌شه…\n{str(e)[-300:]}")
+        if clips is None:
+            clips = []
+            for i, ip in enumerate(imgs):
+                prog(f"🎞 ساخت اسلاید {i + 1} از {n}…")
+                stage(uid, f"render-clip-{i + 1}")
+                cp = os.path.join(work, f"c{i}.mp4")
+                make_clip(ip, cp, nf[i], i)
+                clips.append(cp)
         prog("🎚 ترکیب با صدای گوینده…")
         stage(uid, "render-mux")
         out = os.path.join(work, "out.mp4")
