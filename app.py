@@ -580,6 +580,7 @@ def health():
 def hook():
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != HOOK_SECRET:
         return "forbidden", 403
+    ensure_workers()
     upd = request.get_json(silent=True) or {}
     try:
         if upd.get("callback_query"):
@@ -608,10 +609,22 @@ def setup():
 
 
 setup()
-for _k, _q in (("analyze", ajobs), ("render", jobs)):
-    THREADS[_k] = threading.Thread(target=worker, args=(_q, _k), daemon=True)
-    THREADS[_k].start()
-log.info("workers started")
+_ens_lock = threading.Lock()
+
+
+def ensure_workers():
+    """تردهای کارگر رو (دوباره) راه می‌اندازه. بعد از fork گانیکورن (مثلا preload) یا مرگ ترد لازمه"""
+    with _ens_lock:
+        for k, q in (("analyze", ajobs), ("render", jobs)):
+            t = THREADS.get(k)
+            if not t or not t.is_alive():
+                t = threading.Thread(target=worker, args=(q, k), daemon=True)
+                THREADS[k] = t
+                t.start()
+                log.info("worker %s started (pid=%s)", k, os.getpid())
+
+
+ensure_workers()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
