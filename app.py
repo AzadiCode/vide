@@ -64,6 +64,13 @@ def find_ffmpeg():
 
 
 FFMPEG = find_ffmpeg()
+THREADS = {}
+try:
+    FFVER = subprocess.run([FFMPEG, "-version"], capture_output=True, text=True, timeout=20,
+                           stdin=subprocess.DEVNULL).stdout.splitlines()[0]
+except Exception as _e:
+    FFVER = f"ERROR: {_e}"
+log.info("ffmpeg: %s -> %s", FFMPEG, FFVER)
 
 
 # ───────────────────────── ابزارهای تلگرام ─────────────────────────
@@ -117,6 +124,24 @@ def kb(rows):
     return {"inline_keyboard": rows}
 
 
+def stage(uid, name):
+    """مرحله‌ی فعلی کار رو ثبت می‌کنه تا اگه گیر کرد معلوم باشه کجاست"""
+    log.info("stage uid=%s %s", uid, name)
+    db.sessions.update_one({"_id": uid}, {"$set": {"stage": name, "stage_t": time.time()}})
+
+
+def watchdog(uid, chat):
+    s = db.sessions.find_one({"_id": uid})
+    if not s or s.get("step") != "analyzing":
+        return
+    th = THREADS.get("analyze")
+    since = f"{time.time() - s['stage_t']:.0f} ثانیه پیش" if s.get("stage_t") else "-"
+    say(chat, "⚠️ تحلیل ویس طولانی شد.\n"
+              f"مرحله: {s.get('stage', 'هنوز شروع نشده')} ({since})\n"
+              f"ترد تحلیل زنده: {'بله' if th and th.is_alive() else 'نه'} • صف: {ajobs.qsize()}\n"
+              f"ffmpeg: {FFVER}")
+
+
 # ───────────────────────── سهمیه ─────────────────────────
 def quota_key(uid):
     return f"{uid}:{now():%Y-%m-%d}"
@@ -141,7 +166,8 @@ def quota_refund(uid):
 
 # ───────────────────────── ffmpeg ─────────────────────────
 def run(cmd, timeout=300):
-    p = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
+    p = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout,
+                       stdin=subprocess.DEVNULL)
     if p.returncode != 0:
         raise RuntimeError((p.stderr or "")[-700:])
     return p.stderr or ""
@@ -254,8 +280,10 @@ def analyze_job(uid):
     chat, n = s["chat"], len(s["slides"])
     work = tempfile.mkdtemp(prefix="rv_")
     try:
+        stage(uid, "download")
         vp = tg_download(s["voice"]["fid"], os.path.join(work, "voice"))
         log.info("analyze: downloaded %s bytes", os.path.getsize(vp))
+        stage(uid, "ffmpeg-silencedetect")
         err = run([FFMPEG, "-hide_banner", "-nostats", "-i", vp, "-vn",
                    "-af", f"silencedetect=noise={SIL_DB}:d={SIL_MIN}", "-f", "null", "-"], timeout=120)
         dur, sil = parse_silence(err)
@@ -308,16 +336,19 @@ def render_job(uid):
         bounds = [s["t0"]] + s["cuts"] + [s["t1"]]
         fr = [round((b - bounds[0]) * FPS) for b in bounds]   # فریم تجمعی؛ بدون خطای انباشته‌ی همگام‌سازی
         prog("⬇️ دریافت ویس…")
+        stage(uid, "render-download")
         vp = tg_download(s["voice"]["fid"], os.path.join(work, "voice"))
         clips = []
         for i, sl in enumerate(slides):
             prog(f"🎞 ساخت اسلاید {i + 1} از {n}…")
+            stage(uid, f"render-clip-{i + 1}")
             ip = tg_download(sl["fid"], os.path.join(work, f"s{i}"))
             cp = os.path.join(work, f"c{i}.mp4")
             make_clip(ip, cp, max(fr[i + 1] - fr[i], 2), i)
             os.remove(ip)
             clips.append(cp)
         prog("🎚 ترکیب با صدای گوینده…")
+        stage(uid, "render-mux")
         out = os.path.join(work, "out.mp4")
         dur = bounds[-1] - bounds[0]
         mux(clips, vp, bounds[0], dur, out, work)
@@ -400,6 +431,11 @@ def on_message(msg):
         cmd = text[1:].split()[0].split("@")[0].lower()
         if cmd in ("start", "help"):
             say(chat, help_text())
+        elif cmd == "debug":
+            ta, tr = THREADS.get("analyze"), THREADS.get("render")
+            say(chat, f"ffmpeg: {FFVER}\nترد تحلیل: {'زنده' if ta and ta.is_alive() else 'مرده'} (صف {ajobs.qsize()})\n"
+                      f"ترد رندر: {'زنده' if tr and tr.is_alive() else 'مرده'} (صف {jobs.qsize()})\n"
+                      f"نشست تو: {(s or {}).get('step', '-')} / {(s or {}).get('stage', '-')}")
         elif cmd in ("new", "cancel"):
             if s and s.get("step") in BUSY:
                 return say(chat, "⏳ ویدیوی قبلی هنوز در حال پردازشه؛ کمی صبر کن.")
@@ -449,9 +485,11 @@ def on_message(msg):
         return say(chat, f"⚠️ حداکثر طول ویس {MAX_AUDIO} ثانیه‌ست.")
     slides = sorted(s["slides"], key=lambda x: x["mid"])[:MAX_SLIDES]
     db.sessions.update_one({"_id": uid}, {"$set": {"slides": slides, "chat": chat, "step": "analyzing", "t": now(),
-                                                   "voice": {"fid": voice["file_id"], "dur": voice.get("duration", 0)}}})
+                                                   "voice": {"fid": voice["file_id"], "dur": voice.get("duration", 0)}},
+                                     "$unset": {"stage": ""}})
     say(chat, f"🔍 در حال تحلیل ویس و تقسیم بین {len(slides)} اسلاید…")
     ajobs.put(uid)
+    threading.Timer(45, watchdog, args=(uid, chat)).start()
 
 
 def on_callback(cq):
@@ -570,8 +608,10 @@ def setup():
 
 
 setup()
-threading.Thread(target=worker, args=(ajobs, "analyze"), daemon=True).start()
-threading.Thread(target=worker, args=(jobs, "render"), daemon=True).start()
+for _k, _q in (("analyze", ajobs), ("render", jobs)):
+    THREADS[_k] = threading.Thread(target=worker, args=(_q, _k), daemon=True)
+    THREADS[_k].start()
+log.info("workers started")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
