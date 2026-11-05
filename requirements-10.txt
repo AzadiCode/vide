@@ -1,0 +1,6 @@
+flask
+requests
+pymongo
+mongomock
+gunicorn
+imageio-ffmpeg
