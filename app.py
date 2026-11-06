@@ -978,6 +978,24 @@ def health():
     return "ok"
 
 
+DBG_KEY = hashlib.sha256(("dbg" + BOT_TOKEN).encode()).hexdigest()[:12]
+log.info("debug page: /dbg/%s", DBG_KEY)
+
+
+@app.get("/dbg/<key>")
+def dbg(key):
+    """نشون می‌ده هر ترد دقیقاً تو کدوم خط گیره (برای پیدا کردن علت گیر کردن ساخت ویدیو)"""
+    if key != DBG_KEY:
+        return "forbidden", 403
+    import sys, traceback
+    names = {t.ident: t.name for t in threading.enumerate()}
+    out = [f"pid={os.getpid()} busy={busy_now} jobs={list(jobs)} ajobs={list(ajobs)}"]
+    for tid, fr in sys._current_frames().items():
+        out.append(f"\n--- thread {names.get(tid, tid)}")
+        out.append("".join(traceback.format_stack(fr)))
+    return "\n".join(out), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
 @app.post("/hook")
 def hook():
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != HOOK_SECRET:
@@ -1020,7 +1038,7 @@ def ensure_workers():
         for k, q in (("analyze", ajobs), ("render", jobs)):
             t = THREADS.get(k)
             if not t or not t.is_alive():
-                t = threading.Thread(target=worker, args=(q, k), daemon=True)
+                t = threading.Thread(target=worker, args=(q, k), daemon=True, name=f"worker-{k}")
                 THREADS[k] = t
                 t.start()
                 log.info("worker %s started (pid=%s)", k, os.getpid())
