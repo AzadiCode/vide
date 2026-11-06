@@ -31,6 +31,19 @@ MAX_SLIDES  = int(os.environ.get("MAX_SLIDES", "8"))
 MAX_AUDIO   = int(os.environ.get("MAX_AUDIO", "90"))        # حداکثر طول ویس (ثانیه)
 VIDEO_W     = int(os.environ.get("VIDEO_W", "720"))
 VIDEO_H     = int(os.environ.get("VIDEO_H", "1280"))
+# فرمت‌های قابل انتخاب (نسبت عرض:ارتفاع)؛ ضلع کوتاه همیشه min(VIDEO_W, VIDEO_H)ـه تا رم و کیفیت ثابت بمونه
+FORMATS     = {"9x16": ("9:16 ریلز/استوری", 9, 16), "16x9": ("16:9 افقی/یوتیوب", 16, 9),
+               "1x1": ("1:1 مربع", 1, 1), "4x5": ("4:5 پست اینستا", 4, 5)}
+BASE_S      = min(VIDEO_W, VIDEO_H)
+
+
+def fmt_size(key):
+    _, a, b = FORMATS.get(key) or FORMATS["9x16"]
+    if a >= b:
+        return round(BASE_S * a / b) // 2 * 2, BASE_S
+    return BASE_S, round(BASE_S * b / a) // 2 * 2
+
+
 FPS         = int(os.environ.get("FPS", "25"))
 PRESET      = os.environ.get("X264_PRESET", "ultrafast")
 CRF         = int(os.environ.get("CRF", "24"))
@@ -185,7 +198,8 @@ def _ass_time(t):
 def write_ass(path, subs, cumf):
     """subs[i] = متن اسلاید i؛ cumf = فریم تجمعی مرز اسلایدها. متن با فید و یه حرکت کوتاه به بالا میاد؛ قبل و بعد از کراس‌فید نمی‌مونه"""
     W, H = VIDEO_W, VIDEO_H
-    base = round(W * SUB_SIZE)
+    base = round(min(W, H) * SUB_SIZE)
+    sb = SUB_BOTTOM if H > W else min(SUB_BOTTOM, 0.09)      # تو ویدیوی افقی منوی ریلز نیست؛ زیرنویس پایین‌تر
     ev = []
     for i, raw in enumerate(subs):
         t = (raw or "").strip()
@@ -200,13 +214,13 @@ def write_ass(path, subs, cumf):
         size = round(base * (1.0 if k <= 90 else 0.9 if k <= 160 else 0.8 if k <= 240 else 0.7))
         t = t.replace("\\", "/").replace("{", "(").replace("}", ")")
         t = "\\N".join(x.strip() for x in t.split("\n") if x.strip())
-        y = H - round(H * SUB_BOTTOM)
+        y = H - round(H * sb)
         ev.append(f"Dialogue: 0,{_ass_time(st)},{_ass_time(en)},Sub,,0,0,0,,"
                   f"{{\\fs{size}\\fad(250,250)\\an2\\move({W // 2},{y + 24},{W // 2},{y},0,300)}}{t}")
     head = (f"[Script Info]\nScriptType: v4.00+\nPlayResX: {W}\nPlayResY: {H}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n"
             "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
             "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-            f"Style: Sub,{SUB_FAMILY},{base},&H00FFFFFF,&H00FFFFFF,&H00000000,&H78000000,-1,0,0,0,100,100,0,0,1,3.2,1.2,2,{round(W * 0.08)},{round(W * 0.08)},{round(H * SUB_BOTTOM)},1\n\n"
+            f"Style: Sub,{SUB_FAMILY},{base},&H00FFFFFF,&H00FFFFFF,&H00000000,&H78000000,-1,0,0,0,100,100,0,0,1,3.2,1.2,2,{round(W * 0.08)},{round(W * 0.08)},{round(H * sb)},1\n\n"
             "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
     with open(path, "w", encoding="utf-8") as f:
         f.write(head + "\n".join(ev) + "\n")
@@ -500,58 +514,95 @@ def run_live(cmd, total, on_frame, timeout):
             raise RuntimeError(errf.read().decode("utf-8", "replace")[-700:])
 
 
+XF_GROUP = int(os.environ.get("XF_GROUP", "5"))     # حداکثر تعداد کلیپ هم‌زمان تو یه پاس کراس‌فید؛ کمتر = رم کمتر
+
+
+def _xfade_files(grp, out, half, crf, run_fn, ass=None, frames=None):
+    """grp = لیست (مسیر، فریم شروع روی خط زمانی کل، طول کلیپ)؛ همه رو با کراس‌فید می‌چسبونه و (مسیر، شروع، طول) برمی‌گردونه"""
+    d_f = 2 * half
+    s0 = grp[0][1]
+    total = grp[-1][1] - s0 + grp[-1][2]
+    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error"]
+    for g in grp:
+        cmd += ["-i", g[0]]
+    fc, last = [], "0:v"
+    for k in range(1, len(grp)):
+        fc.append(f"[{last}][{k}:v]xfade=transition=fade:duration={d_f / FPS:.4f}:offset={(grp[k][1] - s0) / FPS:.4f}[x{k}]")
+        last = f"x{k}"
+    if ass:
+        fc.append(f"[{last}]{ass_filter(ass)}[sv]")
+        last = "sv"
+    if not fc:
+        fc.append("[0:v]null[o]")
+        last = "o"
+    cmd += ["-filter_complex", ";".join(fc), "-map", f"[{last}]", "-frames:v", str(frames or total), "-r", str(FPS),
+            "-c:v", "libx264", "-preset", PRESET, "-crf", str(crf), "-threads", "1", "-pix_fmt", "yuv420p", "-an", out]
+    run_fn(cmd, total)
+    return (out, s0, total)
+
+
 def build_video(imgs, nf, out, prog=None, ass=None):
-    """کل ویدیو تو یه پاس ffmpeg: هر اسلاید تمام‌صفحه + زوم نرم، بین اسلایدها کراس‌فید کوتاه که دقیقاً وسط نقطه‌ی برشِ صداست؛
-    پس طول هر اسلاید و همگامی با صدا تغییری نمی‌کنه. فقط یه‌بار انکود می‌شه (بدون کلیپ‌های میانی، سریع‌تر از قبل)"""
+    """ساخت چندمرحله‌ای کم‌مصرف (برای رم ۵۱۲ مگ):
+    ۱) هر اسلاید جدا با زوم نرم به یه کلیپ میانی تبدیل می‌شه (هر بار فقط یه اسلاید تو رم)
+    ۲) کلیپ‌ها گروه‌گروه (XF_GROUP تا) با کراس‌فید که دقیقاً وسط نقطه‌ی برشِ صداست به هم می‌چسبن؛ آخرش زیرنویس سوزونده می‌شه
+    طول هر اسلاید و همگامی با صدا مثل قبل بدون تغییره و مصرف رم به تعداد اسلاید بستگی نداره"""
     n = len(imgs)
     half = 0 if n == 1 else max(1, min(int(round(TRANS_SEC * FPS / 2)), min(nf) // 4))
-    d_f = 2 * half
     cum = [0]
     for x in nf:
         cum.append(cum[-1] + x)
-    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error"]
-    fc = []
-    for i, ip in enumerate(imgs):
-        L = nf[i] + (half if i > 0 else 0) + (half if i < n - 1 else 0)     # هر اسلاید نصف ترنزیشن اضافه، دو طرف
-        cmd += ["-i", ip]
-        fc.append(_slide_chain(i, i, L, f"v{i}"))
-    last = "v0"
-    for i in range(1, n):
-        fc.append(f"[{last}][v{i}]xfade=transition=fade:duration={d_f / FPS:.4f}:offset={(cum[i] - half) / FPS:.4f}[x{i}]")
-        last = f"x{i}"
-    if ass:       # زیرنویس روی کل ویدیو (بعد از کراس‌فید)، تو همین پاس
-        fc.append(f"[{last}]{ass_filter(ass)}[sv]")
-        last = "sv"
-    cmd += ["-filter_complex", ";".join(fc), "-map", f"[{last}]", "-frames:v", str(cum[-1]), "-r", str(FPS),
-            "-c:v", "libx264", "-preset", PRESET, "-crf", str(CRF), "-threads", "1", "-pix_fmt", "yuv420p", "-an", out]
-    if prog is None:
-        return run(cmd, timeout=FX_BUDGET)
-    n_tr = n - 1
-    state = {"txt": "", "t": 0.0}
+    wd = os.path.dirname(out)
+    t_start = time.time()
 
-    def on_frame(f):
-        f = min(f, cum[-1])
-        if n > 1 and f < cum[-1]:
-            tr = next((i for i in range(1, n) if cum[i] - half <= f < cum[i] + half), 0)
-        else:
-            tr = 0
-        i = next((k for k in range(n) if f < cum[k + 1]), n - 1)
-        pct = int(f * 100 / max(cum[-1], 1))
-        bar = "▰" * (pct // 10) + "▱" * (10 - pct // 10)
-        if tr:
-            txt = f"✨ ترنزیشن {tr} از {n_tr}…\n{bar} {pct}٪"
-        else:
-            txt = f"🎞 ساخت اسلاید {i + 1} از {n}…\n{bar} {pct}٪"
-        if txt != state["txt"] and time.time() - state["t"] >= 2.5:     # محدودیت ویرایش پیام تلگرام
-            state["txt"], state["t"] = txt, time.time()
-            try:
-                prog(txt)
-            except Exception:
-                pass
+    def left():
+        return max(30, FX_BUDGET - (time.time() - t_start))
 
-    prog(f"🎞 ساخت اسلاید 1 از {n}…\n▱▱▱▱▱▱▱▱▱▱ 0٪")
-    run_live(cmd, cum[-1], on_frame, FX_BUDGET)
+    bar = lambda pct: "▰" * (pct // 10) + "▱" * (10 - pct // 10)
+    items = []
+    for i, ip in enumerate(imgs):       # مرحله ۱: یه کلیپ در هر لحظه
+        if prog:
+            pct = int(i * 70 / n)
+            prog(f"🎞 ساخت اسلاید {i + 1} از {n}…\n{bar(pct)} {pct}٪")
+        L = nf[i] + (half if i > 0 else 0) + (half if i < n - 1 else 0)
+        kp = os.path.join(wd, f"k{i}.mp4")
+        run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", ip,
+             "-filter_complex", _slide_chain(i, 0, L, "v"), "-map", "[v]", "-frames:v", str(L), "-r", str(FPS),
+             "-c:v", "libx264", "-preset", PRESET, "-crf", "16", "-threads", "1", "-pix_fmt", "yuv420p", "-an", kp],
+            timeout=left())
+        items.append((kp, cum[i] - (half if i > 0 else 0), L))
 
+    if prog:
+        prog(f"✨ ترکیب ترنزیشن‌ها…\n{bar(70)} 70٪")
+    G = max(2, XF_GROUP)
+    level = 0
+    while len(items) > G:               # مرحله ۲: ادغام گروهی تا رم کم بمونه
+        new = []
+        for j in range(0, len(items), G):
+            grp = items[j:j + G]
+            if len(grp) == 1:
+                new.append(grp[0])
+                continue
+            op = os.path.join(wd, f"g{level}_{j}.mp4")
+            new.append(_xfade_files(grp, op, half, 16, lambda c, t: run(c, timeout=left())))
+        items, level = new, level + 1
+
+    state = {"t": 0.0}
+
+    def final_run(cmd, total):
+        if prog is None:
+            return run(cmd, timeout=left())
+
+        def on_frame(f):
+            pct = 70 + int(min(f, total) * 30 / max(total, 1))
+            if time.time() - state["t"] >= 2.5:
+                state["t"] = time.time()
+                try:
+                    prog(f"✨ ترکیب ترنزیشن‌ها…\n{bar(pct)} {pct}٪")
+                except Exception:
+                    pass
+        run_live(cmd, total, on_frame, left())
+
+    _xfade_files(items, out, half, CRF, final_run, ass=ass, frames=cum[-1])
 
 
 def mux(clips, voice, t0, dur, out, work, reencode_crf=None, ass=None):
@@ -579,7 +630,9 @@ def review_view(s):
     b = [s["t0"]] + s["cuts"] + [s["t1"]]
     mode_txt = "🔍 مکث‌محور" if s["mode"] == "pause" else "⚖️ مساوی"
     sub_txt = " • 💬 زیرنویس" if any((x or "").strip() for x in (s.get("subs") or [])) else ""
-    lines = [f"🎙 صدا: {s['t1'] - s['t0']:.1f} ثانیه • 🖼 {n} اسلاید • {mode_txt}{sub_txt}"]
+    fk = s.get("fmt", "9x16")
+    lines = [f"🎙 صدا: {s['t1'] - s['t0']:.1f} ثانیه • 🖼 {n} اسلاید • {mode_txt}{sub_txt}",
+             f"📐 اندازه: {FORMATS.get(fk, FORMATS['9x16'])[0]}"]
     if s["mode"] == "pause" and s.get("found", 0) < n - 1:
         lines.append(f"ℹ️ فقط {s.get('found', 0)} مکث مناسب پیدا شد؛ بقیه‌ی برش‌ها مساوی چیده شد.")
     lines.append("")
@@ -594,6 +647,7 @@ def review_view(s):
                      {"text": "+0.5", "callback_data": f"adj:{i}:5"}])
     rows.append([{"text": "⚖️ تقسیم مساوی", "callback_data": "mode:equal"},
                  {"text": "🔍 تقسیم با مکث", "callback_data": "mode:pause"}])
+    rows.append([{"text": ("✅ " if k == fk else "") + v[0].split()[0], "callback_data": f"fmt:{k}"} for k, v in FORMATS.items()])
     rows.append([{"text": "🎬 ساخت ویدیو", "callback_data": "make"}])
     rows.append([{"text": "❌ لغو", "callback_data": "cancel"}])
     return "\n".join(lines), kb(rows)
@@ -652,6 +706,8 @@ def render_job(uid):
         return
     db.sessions.update_one({"_id": uid}, {"$set": {"step": "rendering"}})
     chat = s["chat"]
+    global VIDEO_W, VIDEO_H            # رندر تک‌نفره‌ست، پس تغییر سراسری امنه
+    VIDEO_W, VIDEO_H = fmt_size(s.get("fmt", "9x16"))
     st = say(chat, "⏳ شروع ساخت ویدیو…")
     pmid = (st.get("result") or {}).get("message_id")
 
@@ -927,6 +983,18 @@ def on_callback(cq):
 
     if step != "review":
         return ans("این مرحله دیگه فعال نیست.", True)
+
+    if data.startswith("fmt:"):
+        key = data[4:]
+        if key not in FORMATS:
+            return ans()
+        if s.get("fmt", "9x16") == key:
+            return ans()
+        db.sessions.update_one({"_id": uid}, {"$set": {"fmt": key, "t": now()}})
+        s["fmt"] = key
+        ans()
+        text, markup = review_view(s)
+        return edit(chat, mid, text, markup)
 
     if data.startswith("mode:"):
         mode = data[5:]
