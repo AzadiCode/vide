@@ -12,7 +12,7 @@ Stack (مثل app-6): Flask + MongoDB(pymongo / mongomock) + وب‌هوک تل�
 - ساخت ویدیو در یه صف تک‌نفره (مناسب پلن رایگان Render: رم کم / CPU ضعیف)
 اجرا: gunicorn app:app -w 1 --threads 4 -t 120   (حتما یک worker، چون صف داخل حافظه‌ست)
 """
-import os, re, time, hashlib, logging, shutil, subprocess, tempfile, threading
+import os, re, time, random, hashlib, logging, shutil, subprocess, tempfile, threading
 from collections import deque
 from datetime import datetime, timezone, timedelta
 
@@ -59,6 +59,16 @@ SUB_FONT    = os.environ.get("SUB_FONT", "").strip()        # مسیر فونت 
 SUB_SIZE    = float(os.environ.get("SUB_SIZE", "0.064"))    # اندازه‌ی متن زیرنویس نسبت به عرض ویدیو
 SUB_BOTTOM  = float(os.environ.get("SUB_BOTTOM", "0.17"))   # فاصله‌ی زیرنویس از پایین (نسبت به ارتفاع)؛ بالاتر از منوی ریلز
 SUB_MAX     = int(os.environ.get("SUB_MAX", "280"))         # حداکثر تعداد حرف زیرنویس هر اسلاید
+# ── افکت صوتی ریزِ بین اسلایدها (فایل‌های کوچیک داخل پوشه‌ی sfx کنار app.py) ──
+SFX_DIR     = os.environ.get("SFX_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "sfx"))
+SFX_VOL     = float(os.environ.get("SFX_VOL", "0.18"))      # بلندی پایه نسبت به صدای گوینده؛ 0 = خاموش
+SFX_PROB    = float(os.environ.get("SFX_PROB", "1"))        # احتمال پخش روی هر ترنزیشن (مثلا 0.7 = ۷۰٪ ترنزیشن‌ها)
+SFX_LEAD    = float(os.environ.get("SFX_LEAD", "0.06"))     # چند ثانیه زودتر از وسط ترنزیشن شروع بشه
+SFX_MAX_SEC = float(os.environ.get("SFX_MAX_SEC", "1.5"))   # بیشترین طول هر افکت (ثانیه)
+SFX_CACHE   = os.path.join(tempfile.gettempdir(), "reel_sfx")   # کش دیسکیِ افکت‌هایی که با ربات آپلود شدن
+SFX_MAX_FILES = int(os.environ.get("SFX_MAX_FILES", "30"))      # سقف تعداد افکت‌های آپلودی
+SFX_MAX_BYTES = 600 * 1024                                      # سقف حجم هر فایل
+SFX_EXT     = (".mp3", ".wav", ".ogg", ".m4a", ".aac", ".opus")
 MIN_SEG     = 1.0    # حداقل طول هر اسلاید در تقسیم خودکار
 MIN_ADJ     = 0.5    # حداقل طول هر اسلاید موقع تنظیم دستی
 BUSY        = ("analyzing", "queued", "rendering")
@@ -605,23 +615,124 @@ def build_video(imgs, nf, out, prog=None, ass=None):
     _xfade_files(items, out, half, CRF, final_run, ass=ass, frames=cum[-1])
 
 
-def mux(clips, voice, t0, dur, out, work, reencode_crf=None, ass=None):
+_AMIX = {}
+
+
+def amix_ok():
+    """amix با normalize=0 (ffmpeg ≥ 4.4) لازمه؛ یه بار چک می‌شه"""
+    if "v" not in _AMIX:
+        try:
+            h = subprocess.run([FFMPEG, "-hide_banner", "-h", "filter=amix"], capture_output=True, encoding="utf-8",
+                               errors="replace", timeout=20, stdin=subprocess.DEVNULL).stdout
+            _AMIX["v"] = "normalize" in h
+        except Exception:
+            _AMIX["v"] = False
+    return _AMIX["v"]
+
+
+def sfx_enabled():
+    d = db.settings.find_one({"_id": "sfx"})
+    return not d or d.get("on", True)
+
+
+def sfx_sync():
+    """افکت‌های ذخیره‌شده تو دیتابیس رو (فقط اگه تو کش نبودن) روی دیسک می‌ریزه؛ ffmpeg فایل لازم داره"""
+    os.makedirs(SFX_CACHE, exist_ok=True)
+    want = {f"{d['_id']}{d.get('ext') or '.ogg'}": d["_id"] for d in db.sfx.find({}, {"ext": 1})}
+    for f in os.listdir(SFX_CACHE):
+        if f not in want:
+            try:
+                os.remove(os.path.join(SFX_CACHE, f))
+            except OSError:
+                pass
+    for fn, _id in want.items():
+        fp = os.path.join(SFX_CACHE, fn)
+        if not os.path.exists(fp):
+            d = db.sfx.find_one({"_id": _id})
+            if d:
+                with open(fp, "wb") as f:
+                    f.write(bytes(d["data"]))
+
+
+def list_sfx():
+    try:
+        sfx_sync()
+    except Exception:
+        log.exception("sfx sync failed")
+    out = []
+    for folder in (SFX_DIR, SFX_CACHE):     # فایل‌های ثابتِ کنار کد + فایل‌های آپلودشده با ربات
+        try:
+            out += [os.path.join(folder, f) for f in sorted(os.listdir(folder)) if f.lower().endswith(SFX_EXT)]
+        except OSError:
+            pass
+    return [f for f in out if 0 < os.path.getsize(f) <= SFX_MAX_BYTES]
+
+
+def plan_sfx(cum, n):
+    """برای هر ترنزیشن یه افکت تصادفی (فایل، تاخیر ms، بلندی، سرعت/پیچ) برمی‌گردونه؛ بدون فایل = لیست خالی"""
+    if not sfx_enabled():
+        return []
+    files = list_sfx()
+    if not files or n < 2 or SFX_VOL <= 0 or not amix_ok():
+        return []
+    plan, last = [], None
+    for i in range(1, n):
+        if random.random() > SFX_PROB:
+            continue
+        pool = [f for f in files if f != last] or files      # دوبار پشت هم یه فایل نیاد
+        p = random.choice(pool)
+        last = p
+        t = max(0.0, cum[i] / FPS - SFX_LEAD + random.uniform(-0.03, 0.03))
+        plan.append((p, int(t * 1000), SFX_VOL * random.uniform(0.7, 1.3), random.uniform(0.93, 1.07)))
+    return plan
+
+
+def _audio_graph(sfx, dur):
+    """صدای گوینده (نرمال‌شده) + افکت‌های ریز روی نقطه‌ی ترنزیشن‌ها؛ ورودی ۱ = ویس، ورودی‌های ۲.. = افکت‌ها"""
+    fc = ["[1:a]loudnorm=I=-16:TP=-1.5:LRA=11,aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[vn]"]
+    labels = "[vn]"
+    for k, (_, ms, vol, rate) in enumerate(sfx):
+        fc.append(f"[{k + 2}:a]atrim=end={SFX_MAX_SEC},aresample=44100,asetrate={int(44100 * rate)},aresample=44100,"
+                  f"aformat=sample_fmts=fltp:channel_layouts=stereo,afade=t=in:d=0.01,volume={vol:.3f},adelay={ms}|{ms}[x{k}]")
+        labels += f"[x{k}]"
+    fc.append(f"{labels}amix=inputs={len(sfx) + 1}:duration=first:normalize=0:dropout_transition=0[m]")
+    fc.append(f"[m]alimiter=limit=0.95:level=0,afade=t=out:st={max(dur - 0.3, 0):.3f}:d=0.3[a]")
+    return ";".join(fc)
+
+
+def mux(clips, voice, t0, dur, out, work, reencode_crf=None, ass=None, sfx=None):
     lst = os.path.join(work, "list.txt")
     with open(lst, "w") as f:
         for c in clips:
             f.write(f"file '{c}'\n")
     cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", lst,
-           "-ss", f"{t0:.3f}", "-t", f"{dur:.3f}", "-i", voice, "-map", "0:v", "-map", "1:a"]
+           "-ss", f"{t0:.3f}", "-t", f"{dur:.3f}", "-i", voice]
+    for p, *_ in (sfx or []):
+        cmd += ["-i", p]
+    if sfx:
+        cmd += ["-filter_complex", _audio_graph(sfx, dur), "-map", "0:v", "-map", "[a]"]
+    else:
+        cmd += ["-map", "0:v", "-map", "1:a",
+                "-af", f"loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=out:st={max(dur - 0.3, 0):.3f}:d=0.3"]
     if reencode_crf or ass:
         if ass:
             cmd += ["-vf", ass_filter(ass)]
         cmd += ["-c:v", "libx264", "-preset", PRESET, "-crf", str(reencode_crf or CRF), "-threads", "1", "-pix_fmt", "yuv420p"]
     else:
         cmd += ["-c:v", "copy"]
-    cmd += ["-af", f"loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=out:st={max(dur - 0.3, 0):.3f}:d=0.3",
-            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2", "-movflags", "+faststart",
-            "-shortest", out]
+    cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2", "-movflags", "+faststart", "-shortest", out]
     run(cmd, timeout=300)
+
+
+def mux_safe(clips, voice, t0, dur, out, work, sfx, **kw):
+    """اگه ترکیب افکت خطا داد، ویدیو بدون افکت ساخته می‌شه؛ افکت هیچ‌وقت نباید ساخت ویدیو رو خراب کنه"""
+    try:
+        return mux(clips, voice, t0, dur, out, work, sfx=sfx, **kw)
+    except Exception:
+        if not sfx:
+            raise
+        log.exception("sfx mux failed; retrying without sfx")
+        return mux(clips, voice, t0, dur, out, work, **kw)
 
 
 # ───────────────────────── نمای پیش‌نمایش برش‌ها ─────────────────────────
@@ -761,10 +872,14 @@ def render_job(uid):
         stage(uid, "render-mux")
         out = os.path.join(work, "out.mp4")
         dur = bounds[-1] - bounds[0]
-        mux(clips, vp, bounds[0], dur, out, work, ass=ass)
+        cum = [0]
+        for x in nf:
+            cum.append(cum[-1] + x)
+        sfx = plan_sfx(cum, n)
+        mux_safe(clips, vp, bounds[0], dur, out, work, sfx, ass=ass)
         if os.path.getsize(out) > 49 * 1024 * 1024:
             prog("🗜 حجم زیاده، فشرده‌سازی…")
-            mux(clips, vp, bounds[0], dur, out, work, reencode_crf=34, ass=ass)
+            mux_safe(clips, vp, bounds[0], dur, out, work, sfx, reencode_crf=34, ass=ass)
         prog("📤 در حال ارسال…")
         with open(out, "rb") as f:
             r = tg_upload("sendVideo", {"chat_id": chat, "caption": "✅ ویدیوت آماده‌ست! برای ساخت بعدی /new",
@@ -817,6 +932,101 @@ def worker(q, kind):
 
 
 # ───────────────────────── هندلرها ─────────────────────────
+# ───────────────────────── مدیریت افکت‌های صوتی (فقط ادمین) ─────────────────────────
+def sfx_panel():
+    items = list(db.sfx.find({}, {"name": 1, "size": 1}).sort("t", 1))
+    on = sfx_enabled()
+    fixed = 0
+    try:
+        fixed = len([f for f in os.listdir(SFX_DIR) if f.lower().endswith(SFX_EXT)])
+    except OSError:
+        pass
+    lines = [f"🔔 افکت‌های بین اسلایدها: {'روشن' if on else 'خاموش'}",
+             f"آپلودشده: {len(items)} از {SFX_MAX_FILES}" + (f" • ثابت (پوشه‌ی sfx): {fixed}" if fixed else "")]
+    rows = [[{"text": "🔕 خاموش کن" if on else "🔔 روشن کن", "callback_data": "sfx:toggle"},
+             {"text": "➕ افزودن", "callback_data": "sfx:add"}]]
+    for i, d in enumerate(items, 1):
+        lines.append(f"{i}. {d['name']} ({max(d['size'] // 1024, 1)}KB)")
+        rows.append([{"text": f"▶️ {i}. {d['name'][:20]}", "callback_data": f"sfx:play:{d['_id']}"},
+                     {"text": "🗑 حذف", "callback_data": f"sfx:del:{d['_id']}"}])
+    if not items:
+        lines.append("هنوز افکتی آپلود نشده؛ «➕ افزودن» رو بزن.")
+    return "\n".join(lines), kb(rows)
+
+
+def sfx_mode(uid, on=None):
+    if on is True:
+        db.sfxmode.update_one({"_id": uid}, {"$set": {"ts": time.time()}}, upsert=True)
+    elif on is False:
+        db.sfxmode.delete_one({"_id": uid})
+    else:
+        d = db.sfxmode.find_one({"_id": uid})
+        return bool(d and time.time() - d.get("ts", 0) < 900)      # حالت افزودن ۱۵ دقیقه معتبره
+
+
+def handle_sfx_add(uid, chat, media):
+    n = db.sfx.count_documents({})
+    if n >= SFX_MAX_FILES:
+        return say(chat, f"⚠️ سقف {SFX_MAX_FILES} افکت پر شده؛ اول یکی رو حذف کن (/sfx).")
+    if (media.get("file_size") or 0) > SFX_MAX_BYTES:
+        return say(chat, f"⚠️ حجم فایل بیشتر از {SFX_MAX_BYTES // 1024} کیلوبایته؛ افکت باید کوچیک باشه.")
+    if (media.get("duration") or 0) > 10:
+        return say(chat, "⚠️ افکت باید کوتاه باشه (زیر ۱۰ ثانیه).")
+    work = tempfile.mkdtemp(prefix="sfx_")
+    try:
+        fp = tg_download(media["file_id"], os.path.join(work, "a"), tries=2)
+        try:
+            run([FFMPEG, "-v", "error", "-t", "0.5", "-i", fp, "-f", "null", "-"], timeout=30)
+        except Exception:
+            return say(chat, "⚠️ این فایل صوتیِ قابل‌خوندن نیست.")
+        with open(fp, "rb") as f:
+            data = f.read()
+        if len(data) > SFX_MAX_BYTES:
+            return say(chat, f"⚠️ حجم فایل بیشتر از {SFX_MAX_BYTES // 1024} کیلوبایته؛ افکت باید کوچیک باشه.")
+        name = os.path.splitext(media.get("file_name") or media.get("title") or "")[0].strip()[:24] or f"sfx{n + 1}"
+        ext = (os.path.splitext(fp)[1] or ".ogg").lower()
+        if ext not in SFX_EXT:
+            ext = ".ogg"
+        db.sfx.insert_one({"_id": f"{int(time.time() * 1000):x}", "name": name, "ext": ext, "size": len(data),
+                           "dur": media.get("duration", 0), "data": data, "t": time.time()})
+        say(chat, f"✅ «{name}» ذخیره شد ({n + 1} از {SFX_MAX_FILES}). فایل بعدی رو بفرست یا /sfx بزن.")
+    except Exception:
+        log.exception("sfx add failed")
+        say(chat, "❌ ذخیره نشد؛ دوباره امتحان کن.")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def on_sfx_callback(cq, data, uid, chat, mid):
+    def ans(text=None, alert=False):
+        tg("answerCallbackQuery", callback_query_id=cq["id"], **({"text": text, "show_alert": alert} if text else {}))
+
+    if uid not in ADMIN_IDS or not chat:
+        return ans("فقط ادمین", True)
+    act = data.split(":")
+    if act[1] == "toggle":
+        db.settings.update_one({"_id": "sfx"}, {"$set": {"on": not sfx_enabled()}}, upsert=True)
+    elif act[1] == "add":
+        sfx_mode(uid, True)
+        ans()
+        return edit(chat, mid, "🎧 فایل‌های صوتی کوتاه رو (هر تعداد) بفرست؛ فرمت mp3/wav/ogg یا ویس تلگرام، زیر "
+                               f"{SFX_MAX_BYTES // 1024} کیلوبایت. فقط {SFX_MAX_SEC:g} ثانیه‌ی اولِ هر کدوم استفاده می‌شه.",
+                    kb([[{"text": "✅ پایان", "callback_data": "sfx:end"}]]))
+    elif act[1] == "end":
+        sfx_mode(uid, False)
+    elif act[1] == "del" and len(act) > 2:
+        db.sfx.delete_one({"_id": act[2]})
+    elif act[1] == "play" and len(act) > 2:
+        d = db.sfx.find_one({"_id": act[2]})
+        ans()
+        if d:
+            tg_upload("sendAudio", {"chat_id": chat, "title": d["name"]},
+                      {"audio": (d["name"] + (d.get("ext") or ".ogg"), bytes(d["data"]))})
+        return
+    ans()
+    edit(chat, mid, *sfx_panel())
+
+
 def help_text():
     return ("🎬 سلام! از اسلایدها و ویس گوینده‌ت ویدیوی ۹:۱۶ مخصوص ریلز می‌سازم.\n\n"
             f"۱) اسلایدها (عکس) رو به ترتیب بفرست — تا {MAX_SLIDES} تا\n"
@@ -871,7 +1081,16 @@ def on_message(msg):
 
     if text.startswith("/"):
         cmd = text[1:].split()[0].split("@")[0].lower()
-        if cmd in ("start", "help"):
+        if cmd != "sfx":
+            sfx_mode(uid, False)
+        if cmd == "sfx":
+            if not ADMIN_IDS:
+                return say(chat, "⚠️ متغیر ADMIN_IDS تنظیم نشده؛ آیدی عددی ادمین رو توش بذار.")
+            if uid not in ADMIN_IDS:
+                return say(chat, "این دستور فقط برای ادمینه.")
+            sfx_mode(uid, False)
+            say(chat, *sfx_panel())
+        elif cmd in ("start", "help"):
             say(chat, help_text())
         elif cmd == "debug":
             ta, tr = THREADS.get("analyze"), THREADS.get("render")
@@ -894,6 +1113,8 @@ def on_message(msg):
     voice = msg.get("voice") or msg.get("audio")
     if not voice and (doc.get("mime_type") or "").startswith("audio/"):
         voice = doc
+    if voice and uid in ADMIN_IDS and sfx_mode(uid):
+        return handle_sfx_add(uid, chat, voice)
     img_fid = None
     if photo:
         img_fid = photo[-1]["file_id"]
@@ -947,6 +1168,8 @@ def on_callback(cq):
     def ans(text=None, alert=False):
         tg("answerCallbackQuery", callback_query_id=cq["id"], **({"text": text, "show_alert": alert} if text else {}))
 
+    if data.startswith("sfx:"):
+        return on_sfx_callback(cq, data, uid, chat, mid)
     s = db.sessions.find_one({"_id": uid})
     if not s or not chat:
         return ans("نشست منقضی شده؛ /new رو بزن.", True)
