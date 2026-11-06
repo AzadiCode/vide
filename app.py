@@ -42,10 +42,6 @@ TRANS_SEC   = float(os.environ.get("TRANS_SEC", "0.30"))    # طول کراس‌
 ZOOM_AMT    = float(os.environ.get("ZOOM_AMT", "0.07"))     # مقدار زوم هر اسلاید (۰.۰۷ = ۷٪)؛ هرچی کمتر، آروم‌تر و کم‌برش‌تر
 ZOOM_CANVAS = float(os.environ.get("ZOOM_CANVAS", "3"))     # ترکیب زوم روی بوم چند برابر بزرگ‌تر؛ بیشتر = نرم‌تر (و کمی کندتر)
 FX_BUDGET   = int(os.environ.get("FX_BUDGET", "480"))       # بیشترین زمان مجاز ساخت ویدیو (ثانیه)؛ بیشتر شد، خودکار نسخه‌ی ساده ساخته می‌شه
-SUB_FONT    = os.environ.get("SUB_FONT", "").strip()        # مسیر فونت فارسی زیرنویس (ttf/otf)؛ خالی = خودکار از کنار app.py یا فونت‌های سیستم
-SUB_SIZE    = float(os.environ.get("SUB_SIZE", "0.064"))    # اندازه‌ی متن زیرنویس نسبت به عرض ویدیو
-SUB_BOTTOM  = float(os.environ.get("SUB_BOTTOM", "0.17"))   # فاصله‌ی زیرنویس از پایین (نسبت به ارتفاع)؛ بالاتر از منوی ریلز
-SUB_MAX     = int(os.environ.get("SUB_MAX", "280"))         # حداکثر تعداد حرف زیرنویس هر اسلاید
 MIN_SEG     = 1.0    # حداقل طول هر اسلاید در تقسیم خودکار
 MIN_ADJ     = 0.5    # حداقل طول هر اسلاید موقع تنظیم دستی
 BUSY        = ("analyzing", "queued", "rendering")
@@ -100,144 +96,6 @@ def _has_filter(name):
 
 FX_OK = FX_MODE != "lite" and _has_filter("xfade")
 log.info("fx: mode=%s xfade=%s", FX_MODE, FX_OK)
-
-
-# ───────────────────────── زیرنویس (ASS + libass؛ شکل‌دهی و راست‌به‌چپ فارسی درست) ─────────────────────────
-def find_sub_font():
-    cands = [SUB_FONT] if SUB_FONT else []
-    here = os.path.dirname(os.path.abspath(__file__))
-    local = []
-    for d in (here, os.path.join(here, "fonts")):
-        try:
-            local += [os.path.join(d, x) for x in os.listdir(d) if x.lower().endswith((".ttf", ".otf"))]
-        except OSError:
-            pass
-    local.sort(key=lambda p: (("vazir" not in p.lower()), ("bold" not in p.lower()), p))
-    cands += local
-    cands += ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-              "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf", "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-              "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
-    return next((c for c in cands if os.path.isfile(c)), None)
-
-
-def font_family(path):
-    """اسم خانواده‌ی فونت از جدول name فایل ttf/otf (libass با همین اسم فونت رو پیدا می‌کنه)"""
-    import struct
-    try:
-        with open(path, "rb") as f:
-            d = f.read()
-        num = struct.unpack(">H", d[4:6])[0]
-        for k in range(num):
-            tag, _, off, ln = struct.unpack(">4sIII", d[12 + 16 * k:28 + 16 * k])
-            if tag == b"name":
-                _, cnt, so = struct.unpack(">HHH", d[off:off + 6])
-                best = None
-                for j in range(cnt):
-                    pid, eid, lid, nid, nl, no = struct.unpack(">6H", d[off + 6 + 12 * j:off + 18 + 12 * j])
-                    if nid != 1:
-                        continue
-                    raw = d[off + so + no: off + so + no + nl]
-                    txt = raw.decode("utf-16-be" if pid in (0, 3) else "latin-1", "ignore").strip()
-                    if txt and (best is None or (pid == 3 and lid == 0x409)):
-                        best = txt
-                return best
-    except Exception:
-        pass
-    return None
-
-
-def _fesc(p):
-    return p.replace("\\", "/").replace("'", "\\'").replace(":", "\\:")
-
-
-SUB_PATH = find_sub_font()
-SUB_FAMILY = (font_family(SUB_PATH) or os.path.splitext(os.path.basename(SUB_PATH))[0]) if SUB_PATH else None
-SUB_DIR = None
-if SUB_PATH:
-    try:
-        SUB_DIR = tempfile.mkdtemp(prefix="subfont_")
-        shutil.copy(SUB_PATH, SUB_DIR)      # فقط همین یه فونت تو پوشه‌ی فونت libass؛ اسکن سریع و بدون سروکله‌زدن با فونت‌های سیستم
-    except Exception as _e:
-        log.warning("subtitle font copy failed: %s", _e)
-        SUB_DIR = None
-
-_SEP = re.compile(r"\s*[-‐‑‒–—―−]+\s*")
-
-
-def parse_subs(text):
-    """متن یه پیام → لیست زیرنویس اسلایدها؛ جداکننده = خطی که فقط خط‌تیره داره"""
-    parts, cur = [], []
-    for line in text.replace("\r", "").split("\n"):
-        if _SEP.fullmatch(line):
-            parts.append("\n".join(cur).strip())
-            cur = []
-        else:
-            cur.append(line.strip())
-    parts.append("\n".join(cur).strip())
-    return parts
-
-
-def _ass_time(t):
-    t = max(t, 0.0)
-    return f"{int(t // 3600)}:{int(t % 3600 // 60):02d}:{t % 60:05.2f}"
-
-
-def write_ass(path, subs, cumf):
-    """subs[i] = متن اسلاید i؛ cumf = فریم تجمعی مرز اسلایدها. متن با فید و یه حرکت کوتاه به بالا میاد؛ قبل و بعد از کراس‌فید نمی‌مونه"""
-    W, H = VIDEO_W, VIDEO_H
-    base = round(W * SUB_SIZE)
-    ev = []
-    for i, raw in enumerate(subs):
-        t = (raw or "").strip()
-        if not t:
-            continue
-        a, b = cumf[i] / FPS, cumf[i + 1] / FPS
-        st = 0.2 if i == 0 else a + 0.18
-        en = b - 0.1 if i == len(subs) - 1 else b - 0.2
-        if en - st < 0.5:
-            st, en = a, b
-        k = len(t.replace("\n", ""))
-        size = round(base * (1.0 if k <= 90 else 0.9 if k <= 160 else 0.8 if k <= 240 else 0.7))
-        t = t.replace("\\", "/").replace("{", "(").replace("}", ")")
-        t = "\\N".join(x.strip() for x in t.split("\n") if x.strip())
-        y = H - round(H * SUB_BOTTOM)
-        ev.append(f"Dialogue: 0,{_ass_time(st)},{_ass_time(en)},Sub,,0,0,0,,"
-                  f"{{\\fs{size}\\fad(250,250)\\an2\\move({W // 2},{y + 24},{W // 2},{y},0,300)}}{t}")
-    head = (f"[Script Info]\nScriptType: v4.00+\nPlayResX: {W}\nPlayResY: {H}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n"
-            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
-            "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-            f"Style: Sub,{SUB_FAMILY},{base},&H00FFFFFF,&H00FFFFFF,&H00000000,&H78000000,-1,0,0,0,100,100,0,0,1,3.2,1.2,2,{round(W * 0.08)},{round(W * 0.08)},{round(H * SUB_BOTTOM)},1\n\n"
-            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(head + "\n".join(ev) + "\n")
-
-
-def ass_filter(path):
-    return f"ass=filename={_fesc(path)}:fontsdir={_fesc(SUB_DIR)}"
-
-
-def _subs_selftest():
-    if not (SUB_PATH and SUB_DIR and _has_filter("ass")):
-        return False
-    d = tempfile.mkdtemp(prefix="subtest_")
-    try:
-        p = os.path.join(d, "t.ass")
-        write_ass(p, ["تست زیرنویس"], [0, 5])
-        r = subprocess.run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=160x284:r=5:d=1",
-                            "-vf", ass_filter(p), "-frames:v", "2", "-f", "null", "-"], capture_output=True, text=True,
-                           timeout=30, stdin=subprocess.DEVNULL)
-        if r.returncode != 0:
-            log.warning("subtitle selftest failed: %s", r.stderr[-300:])
-        return r.returncode == 0
-    except Exception as _e:
-        log.warning("subtitle selftest error: %s", _e)
-        return False
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
-
-
-SUBS_OK = _subs_selftest()
-log.info("subtitles: ok=%s font=%s family=%s", SUBS_OK, SUB_PATH, SUB_FAMILY)
 
 
 # ───────────────────────── ابزارهای تلگرام ─────────────────────────
@@ -488,7 +346,7 @@ def run_live(cmd, total, on_frame, timeout):
             raise RuntimeError(errf.read().decode("utf-8", "replace")[-700:])
 
 
-def build_video(imgs, nf, out, prog=None, ass=None):
+def build_video(imgs, nf, out, prog=None):
     """کل ویدیو تو یه پاس ffmpeg: هر اسلاید تمام‌صفحه + زوم نرم، بین اسلایدها کراس‌فید کوتاه که دقیقاً وسط نقطه‌ی برشِ صداست؛
     پس طول هر اسلاید و همگامی با صدا تغییری نمی‌کنه. فقط یه‌بار انکود می‌شه (بدون کلیپ‌های میانی، سریع‌تر از قبل)"""
     n = len(imgs)
@@ -507,9 +365,6 @@ def build_video(imgs, nf, out, prog=None, ass=None):
     for i in range(1, n):
         fc.append(f"[{last}][v{i}]xfade=transition=fade:duration={d_f / FPS:.4f}:offset={(cum[i] - half) / FPS:.4f}[x{i}]")
         last = f"x{i}"
-    if ass:       # زیرنویس روی کل ویدیو (بعد از کراس‌فید)، تو همین پاس
-        fc.append(f"[{last}]{ass_filter(ass)}[sv]")
-        last = "sv"
     cmd += ["-filter_complex", ";".join(fc), "-map", f"[{last}]", "-frames:v", str(cum[-1]), "-r", str(FPS),
             "-c:v", "libx264", "-preset", PRESET, "-crf", str(CRF), "-threads", "1", "-pix_fmt", "yuv420p", "-an", out]
     if prog is None:
@@ -542,17 +397,15 @@ def build_video(imgs, nf, out, prog=None, ass=None):
 
 
 
-def mux(clips, voice, t0, dur, out, work, reencode_crf=None, ass=None):
+def mux(clips, voice, t0, dur, out, work, reencode_crf=None):
     lst = os.path.join(work, "list.txt")
     with open(lst, "w") as f:
         for c in clips:
             f.write(f"file '{c}'\n")
     cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", lst,
            "-ss", f"{t0:.3f}", "-t", f"{dur:.3f}", "-i", voice, "-map", "0:v", "-map", "1:a"]
-    if reencode_crf or ass:
-        if ass:
-            cmd += ["-vf", ass_filter(ass)]
-        cmd += ["-c:v", "libx264", "-preset", PRESET, "-crf", str(reencode_crf or CRF), "-threads", "1", "-pix_fmt", "yuv420p"]
+    if reencode_crf:
+        cmd += ["-c:v", "libx264", "-preset", PRESET, "-crf", str(reencode_crf), "-threads", "1", "-pix_fmt", "yuv420p"]
     else:
         cmd += ["-c:v", "copy"]
     cmd += ["-af", f"loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=out:st={max(dur - 0.3, 0):.3f}:d=0.3",
@@ -566,8 +419,7 @@ def review_view(s):
     n = len(s["slides"])
     b = [s["t0"]] + s["cuts"] + [s["t1"]]
     mode_txt = "🔍 مکث‌محور" if s["mode"] == "pause" else "⚖️ مساوی"
-    sub_txt = " • 💬 زیرنویس" if any((x or "").strip() for x in (s.get("subs") or [])) else ""
-    lines = [f"🎙 صدا: {s['t1'] - s['t0']:.1f} ثانیه • 🖼 {n} اسلاید • {mode_txt}{sub_txt}"]
+    lines = [f"🎙 صدا: {s['t1'] - s['t0']:.1f} ثانیه • 🖼 {n} اسلاید • {mode_txt}"]
     if s["mode"] == "pause" and s.get("found", 0) < n - 1:
         lines.append(f"ℹ️ فقط {s.get('found', 0)} مکث مناسب پیدا شد؛ بقیه‌ی برش‌ها مساوی چیده شد.")
     lines.append("")
@@ -656,14 +508,6 @@ def render_job(uid):
         stage(uid, "render-download")
         vp = tg_download(s["voice"]["fid"], os.path.join(work, "voice"))
         nf = [max(fr[i + 1] - fr[i], 2) for i in range(n)]
-        ass = None
-        subs = (list(s.get("subs") or []) + [""] * n)[:n]
-        if SUBS_OK and any((x or "").strip() for x in subs):
-            cumf = [0]
-            for x in nf:
-                cumf.append(cumf[-1] + x)
-            ass = os.path.join(work, "subs.ass")
-            write_ass(ass, subs, cumf)
         imgs = []
         for i, sl in enumerate(slides):
             prog(f"📥 دریافت اسلاید {i + 1} از {n}…")
@@ -674,9 +518,8 @@ def render_job(uid):
             try:
                 stage(uid, "render-video")
                 vo = os.path.join(work, "video.mp4")
-                build_video(imgs, nf, vo, prog, ass)
+                build_video(imgs, nf, vo, prog)
                 clips = [vo]
-                ass = None      # تو ویدیو سوخته شده
             except Exception as e:
                 log.exception("crossfade render failed; falling back to hard cuts")
                 prog("⚠️ ساخت کراس‌فید خطا داد؛ نسخه‌ی ساده ساخته می‌شه…"
@@ -693,10 +536,10 @@ def render_job(uid):
         stage(uid, "render-mux")
         out = os.path.join(work, "out.mp4")
         dur = bounds[-1] - bounds[0]
-        mux(clips, vp, bounds[0], dur, out, work, ass=ass)
+        mux(clips, vp, bounds[0], dur, out, work)
         if os.path.getsize(out) > 49 * 1024 * 1024:
             prog("🗜 حجم زیاده، فشرده‌سازی…")
-            mux(clips, vp, bounds[0], dur, out, work, reencode_crf=34, ass=ass)
+            mux(clips, vp, bounds[0], dur, out, work, reencode_crf=34)
         prog("📤 در حال ارسال…")
         with open(out, "rb") as f:
             r = tg_upload("sendVideo", {"chat_id": chat, "caption": "✅ ویدیوت آماده‌ست! برای ساخت بعدی /new",
@@ -753,9 +596,8 @@ def help_text():
     return ("🎬 سلام! از اسلایدها و ویس گوینده‌ت ویدیوی ۹:۱۶ مخصوص ریلز می‌سازم.\n\n"
             f"۱) اسلایدها (عکس) رو به ترتیب بفرست — تا {MAX_SLIDES} تا\n"
             "۲) با دکمه‌ی «تمام شد» برو مرحله‌ی بعد\n"
-            + ("۳) (اختیاری) زیرنویس همه‌ی اسلایدها رو تو یه پیام بفرست؛ بین هر اسلاید یه خط فقط با - بذار\n" if SUBS_OK else "")
-            + f"{'۴' if SUBS_OK else '۳'}) ویس کامل گوینده رو بفرست (تا {MAX_AUDIO} ثانیه)؛ خودم بین اسلایدها تقسیمش می‌کنم\n"
-            f"{'۵' if SUBS_OK else '۴'}) برش‌ها رو اگه لازم بود تنظیم کن و «ساخت ویدیو» رو بزن\n\n"
+            f"۳) ویس کامل گوینده رو بفرست (تا {MAX_AUDIO} ثانیه)؛ خودم بین اسلایدها تقسیمش می‌کنم\n"
+            "۴) برش‌ها رو اگه لازم بود تنظیم کن و «ساخت ویدیو» رو بزن\n\n"
             "/new شروع تازه • /cancel لغو")
 
 
@@ -763,34 +605,6 @@ def new_session(uid, chat):
     s = {"_id": uid, "chat": chat, "step": "slides", "slides": [], "t": now()}
     db.sessions.replace_one({"_id": uid}, s, upsert=True)
     return s
-
-
-def subs_prompt(n, extra=""):
-    return (f"✅ {n} اسلاید ثبت شد.{extra}\n\n"
-            "✍️ حالا زیرنویس اسلایدها رو به ترتیب، همه تو یه پیام بفرست. بین زیرنویس هر اسلاید یه خط فقط با - بذار:\n\n"
-            "متن اسلاید اول\n-\nمتن اسلاید دوم\n-\nمتن اسلاید سوم\n\n"
-            f"• تعداد بخش‌ها باید {n} تا باشه\n"
-            "• اسلایدی که زیرنویس نمی‌خواد، جاش رو خالی بذار\n"
-            "• زیرنویس نمی‌خوای؟ دکمه‌ی پایین رو بزن")
-
-
-def handle_subs(uid, chat, s, text):
-    n = len(s["slides"])
-    parts = parse_subs(text)
-    if len(parts) == n + 1 and (not parts[0] or not parts[-1]):      # خط‌تیره‌ی اضافه اول یا آخر پیام
-        parts = parts[1:] if not parts[0] else parts[:-1]
-    if len(parts) != n:
-        return say(chat, f"⚠️ {len(parts)} بخش زیرنویس پیدا کردم ولی {n} اسلاید داری.\n\n"
-                         "بین زیرنویس هر اسلاید یه خط فقط با - بذار و دوباره همه رو تو یه پیام بفرست. "
-                         "اسلایدی که زیرنویس نمی‌خواد، جاش رو خالی بذار.")
-    if not any(parts):
-        return say(chat, "⚠️ همه‌ی زیرنویس‌ها خالیه. اگه زیرنویس نمی‌خوای، همین‌طوری ویس رو بفرست.")
-    long_ = [str(i + 1) for i, p in enumerate(parts) if len(p) > SUB_MAX]
-    if long_:
-        return say(chat, f"⚠️ زیرنویس اسلاید {'، '.join(long_)} از {SUB_MAX} حرف بلندتره. کوتاه‌ترش کن و دوباره بفرست.")
-    db.sessions.update_one({"_id": uid}, {"$set": {"subs": parts, "step": "voice", "t": now()}})
-    prev = "\n".join(f"{i + 1}. " + ((p.replace("\n", " ")[:30] + ("…" if len(p) > 30 else "")) if p else "—") for i, p in enumerate(parts))
-    say(chat, f"✅ زیرنویس ثبت شد:\n{prev}\n\n🎙 حالا ویس کامل گوینده رو بفرست.\n(برای اصلاح زیرنویس، دوباره بفرستش.)")
 
 
 def on_message(msg):
@@ -809,7 +623,6 @@ def on_message(msg):
             ta, tr = THREADS.get("analyze"), THREADS.get("render")
             say(chat, f"ffmpeg: {FFVER}\nترد تحلیل: {'زنده' if ta and ta.is_alive() else 'مرده'} (صف {len(ajobs)})\n"
                       f"ترد رندر: {'زنده' if tr and tr.is_alive() else 'مرده'} (صف {len(jobs)})\n"
-                      f"زیرنویس: {'فعال، فونت ' + str(SUB_FAMILY) if SUBS_OK else 'غیرفعال (فونت یا فیلتر ass پیدا نشد)'}\n"
                       f"نشست تو: {(s or {}).get('step', '-')} / {(s or {}).get('stage', '-')}")
         elif cmd in ("new", "cancel"):
             if s and s.get("step") in BUSY:
@@ -832,8 +645,6 @@ def on_message(msg):
     elif (doc.get("mime_type") or "").startswith("image/"):
         img_fid = doc["file_id"]
 
-    if text and not img_fid and not voice and SUBS_OK and s and s.get("step") in ("subs", "voice"):
-        return handle_subs(uid, chat, s, text)
     if not img_fid and not voice:
         return say(chat, help_text())
     if s and s.get("step") in BUSY:
@@ -854,8 +665,6 @@ def on_message(msg):
         return
 
     # ویس
-    if step == "subs":
-        return say(chat, "✍️ اول زیرنویس اسلایدها رو بفرست، یا دکمه‌ی «بدون زیرنویس» رو بزن.")
     if step == "slides" and not s["slides"]:
         return say(chat, "اول اسلایدها (عکس) رو بفرست 🖼")
     if (voice.get("file_size") or 0) > 20 * 1024 * 1024:
@@ -897,21 +706,10 @@ def on_callback(cq):
         n = len(s["slides"])
         if n == 0:
             return ans("اول حداقل یه اسلاید بفرست.", True)
-        extra = f"\n(فقط {MAX_SLIDES} اسلاید اول استفاده می‌شه)" if n > MAX_SLIDES else ""
-        slides = sorted(s["slides"], key=lambda x: x["mid"])[:MAX_SLIDES]
-        ans()
-        if SUBS_OK:
-            db.sessions.update_one({"_id": uid}, {"$set": {"step": "subs", "slides": slides, "t": now()}, "$unset": {"subs": ""}})
-            return edit(chat, mid, subs_prompt(len(slides), extra), kb([[{"text": "⏭ بدون زیرنویس", "callback_data": "nosub"}]]))
         db.sessions.update_one({"_id": uid}, {"$set": {"step": "voice", "t": now()}})
-        return edit(chat, mid, f"✅ {min(n, MAX_SLIDES)} اسلاید ثبت شد.{extra}\n\n🎙 حالا ویس کامل گوینده رو بفرست.")
-
-    if data == "nosub":
-        if step != "subs":
-            return ans()
-        db.sessions.update_one({"_id": uid}, {"$set": {"step": "voice", "t": now()}, "$unset": {"subs": ""}})
         ans()
-        return edit(chat, mid, "✅ بدون زیرنویس.\n\n🎙 حالا ویس کامل گوینده رو بفرست.")
+        extra = f"\n(فقط {MAX_SLIDES} اسلاید اول استفاده می‌شه)" if n > MAX_SLIDES else ""
+        return edit(chat, mid, f"✅ {min(n, MAX_SLIDES)} اسلاید ثبت شد.{extra}\n\n🎙 حالا ویس کامل گوینده رو بفرست.")
 
     if step != "review":
         return ans("این مرحله دیگه فعال نیست.", True)
