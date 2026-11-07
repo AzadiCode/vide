@@ -12,7 +12,7 @@ Stack (مثل app-6): Flask + MongoDB(pymongo / mongomock) + وب‌هوک تل�
 - ساخت ویدیو در یه صف تک‌نفره (مناسب پلن رایگان Render: رم کم / CPU ضعیف)
 اجرا: gunicorn app:app -w 1 --threads 4 -t 120   (حتما یک worker، چون صف داخل حافظه‌ست)
 """
-import os, re, time, random, hashlib, logging, shutil, subprocess, tempfile, threading
+import os, re, sys, math, array, operator, time, random, hashlib, logging, shutil, subprocess, tempfile, threading
 from collections import deque
 from datetime import datetime, timezone, timedelta
 
@@ -48,7 +48,7 @@ FPS         = int(os.environ.get("FPS", "25"))
 PRESET      = os.environ.get("X264_PRESET", "ultrafast")
 CRF         = int(os.environ.get("CRF", "24"))
 SIL_DB      = os.environ.get("SIL_DB", "auto")              # آستانه‌ی سکوت؛ auto = از روی بلندی خود ویس حساب می‌شه
-SIL_MIN     = float(os.environ.get("SIL_MIN", "0.18"))      # حداقل طول مکث (ثانیه)؛ مکث‌های کوتاه هم دیده می‌شن، قدرتشون در DP سنجیده می‌شه
+SIL_MIN     = float(os.environ.get("SIL_MIN", "0.15"))      # حداقل طول مکث (ثانیه)؛ مکث‌های کوتاه هم دیده می‌شن، قدرتشون در DP سنجیده می‌شه
 DEBUG       = os.environ.get("DEBUG", "") == "1"            # علت دقیق خطا رو برای کاربر نشون می‌ده
 FX_MODE     = os.environ.get("FX", "pro").strip().lower()   # pro = زوم نرم + کراس‌فید | lite = زوم نرم + برش مستقیم (بدون کراس‌فید)
 TRANS_SEC   = float(os.environ.get("TRANS_SEC", "0.30"))    # طول کراس‌فید بین اسلایدها (ثانیه)
@@ -411,40 +411,117 @@ def cut_point(st, en):
     return max((st + en) / 2, en - 0.25)
 
 
-def cuts_dp(sil, n, t0, t1):
-    """بهترین N-1 برش از بین همه‌ی مکث‌ها با برنامه‌ریزی پویا:
-    مکث‌های قوی‌تر (بلندتر) امتیاز می‌گیرن، و طول‌های خیلی نامتعادل جریمه می‌شن. اگه شدنی نبود None"""
+# ───────────────────────── تشخیص مکث (دقیق‌تر از silencedetect) ─────────────────────────
+def _frame_db(vp):
+    """صدا → مونو ۸کیلوهرتز → انرژی (dB) هر ۱۰ میلی‌ثانیه (بدون numpy)"""
+    p = subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-i", vp, "-vn", "-ac", "1", "-ar", "8000",
+                        "-f", "s16le", "-"], capture_output=True, timeout=120, stdin=subprocess.DEVNULL)
+    if p.returncode != 0 or len(p.stdout) < 1600:
+        raise RuntimeError("decode: " + (p.stderr or b"").decode("utf-8", "replace")[-300:])
+    a = array.array("h")
+    a.frombytes(p.stdout[: len(p.stdout) // 2 * 2])
+    if sys.byteorder == "big":
+        a.byteswap()
+    F, mul, out = 80, operator.mul, []
+    for i in range(0, len(a) - F + 1, F):
+        seg = a[i:i + F]
+        out.append(10.0 * math.log10(sum(map(mul, seg, seg)) / F + 1.0))
+    return out
+
+
+def detect_pauses(vp):
+    """مکث‌ها رو با آستانه‌ی تطبیقی (از روی کف نویز و بلندی گفتار همین ویس) پیدا می‌کنه.
+    خروجی: (طول کل، [(شروع، پایان، طول)]) — طول واقعی مکث‌ها، نه فقط «بلندتر از آستانه»"""
+    db = _frame_db(vp)
+    n = len(db)
+    if n < 50:
+        raise RuntimeError("too short")
+    s = sorted(db)
+    lo, hi = s[int(n * 0.05)], s[int(n * 0.90)]
+    thr = lo + 0.4 * (hi - lo)
+    thr = max(thr, lo + 6.0)
+    thr = min(thr, hi - 20.0)
+    thr = max(thr, hi - 40.0)
+    min_f = max(2, int(round(SIL_MIN * 100)))
+    runs, i = [], 0
+    while i < n:
+        if db[i] < thr:
+            j = i
+            while j < n and db[j] < thr:
+                j += 1
+            runs.append([i, j])
+            i = j
+        else:
+            i += 1
+    merged = []
+    for r in runs:                                   # کلیک/نفس خیلی کوتاه وسط مکث، مکث رو دو تیکه نکنه
+        if merged and r[0] - merged[-1][1] <= 4:
+            merged[-1][1] = r[1]
+        else:
+            merged.append(r)
+    sil = [(a / 100.0, b / 100.0, (b - a) / 100.0) for a, b in merged if b - a >= min_f]
+    log.info("pauses: thr=%.1fdB lo=%.1f hi=%.1f found=%d", thr, lo, hi, len(sil))
+    return n / 100.0, sil
+
+
+def slide_weights(subs, n):
+    """از روی طول متن هر اسلاید، سهم زمانیِ مورد انتظارش رو حدس می‌زنه (اگه زیرنویس/سناریو داده شده باشه)"""
+    if not subs or len(subs) != n:
+        return None
+    w = [len(re.sub(r"[\W_]+", "", x or "")) for x in subs]
+    filled = [x for x in w if x]
+    if not filled:
+        return None
+    avg = sum(filled) / len(filled)
+    return [(x if x else avg) + 8 for x in w]
+
+
+def _strength(du):
+    return min(du, 2.0) ** 1.5
+
+
+def cuts_dp(sil, n, t0, t1, w=None):
+    """بهترین N-1 برش از بین مکث‌ها با برنامه‌ریزی پویا.
+    امتیاز = قدرت مکث (بلندتر = بهتر) − جریمه‌ی فاصله از طول مورد انتظار هر اسلاید.
+    اگه متن اسلایدها هست، طول مورد انتظار از روی تعداد حروف هر اسلاید می‌آد (نه مساوی)؛ وگرنه جریمه‌ی تعادل خیلی کم‌اثره
+    تا مکث‌های واقعیِ بین بندها جلوی «طول مساوی» نبازن. اگه شدنی نبود None"""
     if n <= 1:
         return [], 0
     cand = []
     for st, en, du in sil:
         c = cut_point(st, en)
         if t0 + MIN_SEG <= c <= t1 - MIN_SEG:
-            cand.append((c, min(du, 1.2)))
+            cand.append((c, _strength(du)))
     cand.sort()
     m, k_need = len(cand), n - 1
     if m < k_need:
         return None
-    tgt = (t1 - t0) / n
-    pen = lambda d: 0.8 * ((d - tgt) / tgt) ** 2
+    T = t1 - t0
+    if w and len(w) == n and sum(w) > 0:
+        tot = sum(w)
+        exp, lam = [max(T * x / tot, 0.5) for x in w], 1.0
+    else:
+        exp, lam = [T / n] * n, 0.2
+    pen = lambda d, k: lam * ((d - exp[k]) / exp[k]) ** 2
+    WS = 3.0
     NEG = -1e18
     dp = [[NEG] * m for _ in range(k_need + 1)]
     par = [[-1] * m for _ in range(k_need + 1)]
     for j in range(m):
         if cand[j][0] - t0 >= MIN_SEG:
-            dp[1][j] = 2.0 * cand[j][1] - pen(cand[j][0] - t0)
+            dp[1][j] = WS * cand[j][1] - pen(cand[j][0] - t0, 0)
     for k in range(2, k_need + 1):
         for j in range(m):
             for i in range(j):
                 if dp[k - 1][i] <= NEG or cand[j][0] - cand[i][0] < MIN_SEG:
                     continue
-                v = dp[k - 1][i] + 2.0 * cand[j][1] - pen(cand[j][0] - cand[i][0])
+                v = dp[k - 1][i] + WS * cand[j][1] - pen(cand[j][0] - cand[i][0], k - 1)
                 if v > dp[k][j]:
                     dp[k][j], par[k][j] = v, i
     best, bj = NEG, -1
     for j in range(m):
         if dp[k_need][j] > NEG and t1 - cand[j][0] >= MIN_SEG:
-            v = dp[k_need][j] - pen(t1 - cand[j][0])
+            v = dp[k_need][j] - pen(t1 - cand[j][0], n - 1)
             if v > best:
                 best, bj = v, j
     if bj < 0:
@@ -456,8 +533,8 @@ def cuts_dp(sil, n, t0, t1):
     return out[::-1], k_need
 
 
-def cuts_pause(sil, n, t0, t1):
-    r = cuts_dp(sil, n, t0, t1)
+def cuts_pause(sil, n, t0, t1, w=None):
+    r = cuts_dp(sil, n, t0, t1, w)
     return r if r else cuts_greedy(sil, n, t0, t1)
 
 
@@ -776,11 +853,15 @@ def analyze_job(uid):
         vp = tg_download(s["voice"]["fid"], os.path.join(work, "voice"))
         log.info("analyze: downloaded %s bytes", os.path.getsize(vp))
         stage(uid, "ffmpeg-silencedetect")
-        noise = auto_noise(vp)
-        log.info("silence threshold: %s", noise)
-        err = run([FFMPEG, "-hide_banner", "-nostats", "-i", vp, "-vn",
-                   "-af", f"silencedetect=noise={noise}:d={SIL_MIN}", "-f", "null", "-"], timeout=120)
-        dur, sil = parse_silence(err)
+        try:
+            dur, sil = detect_pauses(vp)
+        except Exception:
+            log.exception("detect_pauses failed; fallback to silencedetect")
+            noise = auto_noise(vp)
+            log.info("silence threshold: %s", noise)
+            err = run([FFMPEG, "-hide_banner", "-nostats", "-i", vp, "-vn",
+                       "-af", f"silencedetect=noise={noise}:d={SIL_MIN}", "-f", "null", "-"], timeout=120)
+            dur, sil = parse_silence(err)
         dur = dur or float(s["voice"].get("dur") or 0)
         if dur <= 0:
             raise ValueError("bad_audio")
@@ -796,7 +877,7 @@ def analyze_job(uid):
             db.sessions.update_one({"_id": uid}, {"$set": {"step": "voice"}})
             return say(chat, f"⚠️ ویس برای {n} اسلاید خیلی کوتاهه (حداقل {n * MIN_SEG:.0f} ثانیه گفتار لازمه). ویس بلندتری بفرست.")
         internal = [list(x) for x in sil if x[0] > 0.1 and x[1] < dur - 0.1]
-        cuts, found = cuts_pause(internal, n, t0, t1)
+        cuts, found = cuts_pause(internal, n, t0, t1, slide_weights(s.get("subs"), n))
         s2 = {"step": "review", "dur": dur, "t0": round(t0, 2), "t1": round(t1, 2), "sil": internal,
               "mode": "pause", "cuts": cuts, "found": found, "t": now()}
         db.sessions.update_one({"_id": uid}, {"$set": s2})
@@ -1225,7 +1306,7 @@ def on_callback(cq):
         if mode == "equal":
             cuts, found = cuts_equal(n, s["t0"], s["t1"]), 0
         else:
-            cuts, found = cuts_pause(s.get("sil", []), n, s["t0"], s["t1"])
+            cuts, found = cuts_pause(s.get("sil", []), n, s["t0"], s["t1"], slide_weights(s.get("subs"), n))
         mode = "equal" if mode == "equal" else "pause"
         db.sessions.update_one({"_id": uid}, {"$set": {"mode": mode, "cuts": cuts, "found": found, "t": now()}})
         s.update(mode=mode, cuts=cuts, found=found)
