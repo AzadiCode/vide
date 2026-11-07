@@ -461,6 +461,7 @@ def detect_pauses(vp):
             merged.append(r)
     sil = [(a / 100.0, b / 100.0, (b - a) / 100.0) for a, b in merged if b - a >= min_f]
     log.info("pauses: thr=%.1fdB lo=%.1f hi=%.1f found=%d", thr, lo, hi, len(sil))
+    detect_pauses.last = {"thr": round(thr, 1), "lo": round(lo, 1), "hi": round(hi, 1)}
     return n / 100.0, sil
 
 
@@ -812,12 +813,38 @@ def mux_safe(clips, voice, t0, dur, out, work, sfx, **kw):
         return mux(clips, voice, t0, dur, out, work, **kw)
 
 
+def pause_report(s):
+    n = len(s["slides"])
+    sil, cuts = s.get("sil") or [], s.get("cuts") or []
+    d = s.get("dbg") or {}
+    L = [f"🔬 گزارش تحلیل ویس", f"مدت کل: {s.get('dur', 0):.2f}s • گفتار از {s['t0']:.2f} تا {s['t1']:.2f}",
+         f"آستانه: {d.get('thr', '؟')}dB (کف نویز {d.get('lo', '؟')} / گفتار {d.get('hi', '؟')})",
+         f"مکث‌های پیدا‌شده: {len(sil)} • برش لازم: {n - 1}", ""]
+    w = slide_weights(s.get("subs"), n)
+    if w:
+        T, tot, acc, exp = s["t1"] - s["t0"], sum(w), 0.0, []
+        for x in w[:-1]:
+            acc += T * x / tot
+            exp.append(round(s["t0"] + acc, 1))
+        L.append("برش‌های مورد انتظار از روی طول متن: " + ", ".join(map(str, exp)))
+        L.append("")
+    else:
+        L.append("(زیرنویس نداری؛ فقط از روی صدا حدس زده شد)\n")
+    L.append("شروع → پایان (طول)   ✂️=برش انتخابی")
+    for st, en, du in sil[:70]:
+        c = cut_point(st, en)
+        k = next((i + 1 for i, x in enumerate(cuts) if abs(x - c) < 0.03), None)
+        L.append(f"{st:.2f} → {en:.2f} ({du:.2f}s)" + (f"  ✂️{k}" if k else ""))
+    return "\n".join(L)[:3900]
+
+
 # ───────────────────────── نمای پیش‌نمایش برش‌ها ─────────────────────────
 def review_view(s):
     n = len(s["slides"])
     b = [s["t0"]] + s["cuts"] + [s["t1"]]
     mode_txt = "🔍 مکث‌محور" if s["mode"] == "pause" else "⚖️ مساوی"
-    sub_txt = " • 💬 زیرنویس" if any((x or "").strip() for x in (s.get("subs") or [])) else ""
+    has_txt = any((x or "").strip() for x in (s.get("subs") or []))
+    sub_txt = (" • 💬 زیرنویس" if s.get("subs_show", True) else " • 🎯 سناریو (فقط تقسیم)") if has_txt else ""
     fk = s.get("fmt", "9x16")
     lines = [f"🎙 صدا: {s['t1'] - s['t0']:.1f} ثانیه • 🖼 {n} اسلاید • {mode_txt}{sub_txt}",
              f"📐 اندازه: {FORMATS.get(fk, FORMATS['9x16'])[0]}"]
@@ -836,6 +863,7 @@ def review_view(s):
     rows.append([{"text": "⚖️ تقسیم مساوی", "callback_data": "mode:equal"},
                  {"text": "🔍 تقسیم با مکث", "callback_data": "mode:pause"}])
     rows.append([{"text": ("✅ " if k == fk else "") + v[0].split()[0], "callback_data": f"fmt:{k}"} for k, v in FORMATS.items()])
+    rows.append([{"text": "🔬 گزارش مکث‌ها", "callback_data": "dbg"}])
     rows.append([{"text": "🎬 ساخت ویدیو", "callback_data": "make"}])
     rows.append([{"text": "❌ لغو", "callback_data": "cancel"}])
     return "\n".join(lines), kb(rows)
@@ -879,7 +907,8 @@ def analyze_job(uid):
         internal = [list(x) for x in sil if x[0] > 0.1 and x[1] < dur - 0.1]
         cuts, found = cuts_pause(internal, n, t0, t1, slide_weights(s.get("subs"), n))
         s2 = {"step": "review", "dur": dur, "t0": round(t0, 2), "t1": round(t1, 2), "sil": internal,
-              "mode": "pause", "cuts": cuts, "found": found, "t": now()}
+              "mode": "pause", "cuts": cuts, "found": found, "t": now(),
+              "dbg": getattr(detect_pauses, "last", None)}
         db.sessions.update_one({"_id": uid}, {"$set": s2})
         s.update(s2)
         text, markup = review_view(s)
@@ -918,7 +947,7 @@ def render_job(uid):
         nf = [max(fr[i + 1] - fr[i], 2) for i in range(n)]
         ass = None
         subs = (list(s.get("subs") or []) + [""] * n)[:n]
-        if SUBS_OK and any((x or "").strip() for x in subs):
+        if SUBS_OK and s.get("subs_show", True) and any((x or "").strip() for x in subs):
             cumf = [0]
             for x in nf:
                 cumf.append(cumf[-1] + x)
@@ -1112,9 +1141,9 @@ def help_text():
     return ("🎬 سلام! از اسلایدها و ویس گوینده‌ت ویدیوی ۹:۱۶ مخصوص ریلز می‌سازم.\n\n"
             f"۱) اسلایدها (عکس) رو به ترتیب بفرست — تا {MAX_SLIDES} تا\n"
             "۲) با دکمه‌ی «تمام شد» برو مرحله‌ی بعد\n"
-            + ("۳) (اختیاری) زیرنویس همه‌ی اسلایدها رو تو یه پیام بفرست؛ بین هر اسلاید یه خط فقط با - بذار\n" if SUBS_OK else "")
-            + f"{'۴' if SUBS_OK else '۳'}) ویس کامل گوینده رو بفرست (تا {MAX_AUDIO} ثانیه)؛ خودم بین اسلایدها تقسیمش می‌کنم\n"
-            f"{'۵' if SUBS_OK else '۴'}) برش‌ها رو اگه لازم بود تنظیم کن و «ساخت ویدیو» رو بزن\n\n"
+            + "۳) (پیشنهادی) متن همه‌ی اسلایدها رو تو یه پیام بفرست؛ بین هر اسلاید یه خط فقط با - بذار (تقسیم صدا دقیق‌تر می‌شه؛ نمایش روی ویدیو قابل خاموش‌کردنه)\n"
+            + f"۴) ویس کامل گوینده رو بفرست (تا {MAX_AUDIO} ثانیه)؛ خودم بین اسلایدها تقسیمش می‌کنم\n"
+            f"۵) برش‌ها رو اگه لازم بود تنظیم کن و «ساخت ویدیو» رو بزن\n\n"
             "/new شروع تازه • /cancel لغو")
 
 
@@ -1124,13 +1153,22 @@ def new_session(uid, chat):
     return s
 
 
-def subs_prompt(n, extra=""):
+def subs_prompt(n, extra="", show=True):
     return (f"✅ {n} اسلاید ثبت شد.{extra}\n\n"
-            "✍️ حالا زیرنویس اسلایدها رو به ترتیب، همه تو یه پیام بفرست. بین زیرنویس هر اسلاید یه خط فقط با - بذار:\n\n"
+            "✍️ حالا متن (سناریو) اسلایدها رو به ترتیب، همه تو یه پیام بفرست. بین متن هر اسلاید یه خط فقط با - بذار:\n\n"
             "متن اسلاید اول\n-\nمتن اسلاید دوم\n-\nمتن اسلاید سوم\n\n"
             f"• تعداد بخش‌ها باید {n} تا باشه\n"
-            "• اسلایدی که زیرنویس نمی‌خواد، جاش رو خالی بذار\n"
-            "• زیرنویس نمی‌خوای؟ دکمه‌ی پایین رو بزن")
+            "• از روی طول متن، برش‌های ویس خیلی دقیق‌تر می‌شه\n"
+            + ("• نمایش روی ویدیو: ✅ روشن (به‌صورت زیرنویس)\n" if show else "• نمایش روی ویدیو: ❌ خاموش (فقط برای تقسیم دقیق صدا)\n")
+            + "• متن نمی‌خوای؟ دکمه‌ی «بدون سناریو» رو بزن")
+
+
+def subs_kb(show):
+    rows = []
+    if SUBS_OK:
+        rows.append([{"text": "👁 نمایش روی ویدیو: " + ("روشن ✅" if show else "خاموش ❌") + " (تغییر)", "callback_data": "subshow"}])
+    rows.append([{"text": "⏭ بدون سناریو", "callback_data": "nosub"}])
+    return kb(rows)
 
 
 def handle_subs(uid, chat, s, text):
@@ -1144,12 +1182,13 @@ def handle_subs(uid, chat, s, text):
                          "اسلایدی که زیرنویس نمی‌خواد، جاش رو خالی بذار.")
     if not any(parts):
         return say(chat, "⚠️ همه‌ی زیرنویس‌ها خالیه. اگه زیرنویس نمی‌خوای، همین‌طوری ویس رو بفرست.")
-    long_ = [str(i + 1) for i, p in enumerate(parts) if len(p) > SUB_MAX]
+    show = bool(SUBS_OK and s.get("subs_show", True))
+    long_ = [str(i + 1) for i, p in enumerate(parts) if show and len(p) > SUB_MAX]
     if long_:
         return say(chat, f"⚠️ زیرنویس اسلاید {'، '.join(long_)} از {SUB_MAX} حرف بلندتره. کوتاه‌ترش کن و دوباره بفرست.")
-    db.sessions.update_one({"_id": uid}, {"$set": {"subs": parts, "step": "voice", "t": now()}})
+    db.sessions.update_one({"_id": uid}, {"$set": {"subs": parts, "subs_show": show, "step": "voice", "t": now()}})
     prev = "\n".join(f"{i + 1}. " + ((p.replace("\n", " ")[:30] + ("…" if len(p) > 30 else "")) if p else "—") for i, p in enumerate(parts))
-    say(chat, f"✅ زیرنویس ثبت شد:\n{prev}\n\n🎙 حالا ویس کامل گوینده رو بفرست.\n(برای اصلاح زیرنویس، دوباره بفرستش.)")
+    say(chat, f"✅ متن ثبت شد ({'نمایش روی ویدیو' if show else 'فقط برای تقسیم صدا'}):\n{prev}\n\n🎙 حالا ویس کامل گوینده رو بفرست.\n(برای اصلاح متن، دوباره بفرستش.)")
 
 
 def on_message(msg):
@@ -1202,7 +1241,7 @@ def on_message(msg):
     elif (doc.get("mime_type") or "").startswith("image/"):
         img_fid = doc["file_id"]
 
-    if text and not img_fid and not voice and SUBS_OK and s and s.get("step") in ("subs", "voice"):
+    if text and not img_fid and not voice and s and s.get("step") in ("subs", "voice"):
         return handle_subs(uid, chat, s, text)
     if not img_fid and not voice:
         return say(chat, help_text())
@@ -1225,7 +1264,7 @@ def on_message(msg):
 
     # ویس
     if step == "subs":
-        return say(chat, "✍️ اول زیرنویس اسلایدها رو بفرست، یا دکمه‌ی «بدون زیرنویس» رو بزن.")
+        return say(chat, "✍️ اول متن اسلایدها رو بفرست، یا دکمه‌ی «بدون سناریو» رو بزن.")
     if step == "slides" and not s["slides"]:
         return say(chat, "اول اسلایدها (عکس) رو بفرست 🖼")
     if (voice.get("file_size") or 0) > 20 * 1024 * 1024:
@@ -1272,18 +1311,25 @@ def on_callback(cq):
         extra = f"\n(فقط {MAX_SLIDES} اسلاید اول استفاده می‌شه)" if n > MAX_SLIDES else ""
         slides = sorted(s["slides"], key=lambda x: x["mid"])[:MAX_SLIDES]
         ans()
-        if SUBS_OK:
-            db.sessions.update_one({"_id": uid}, {"$set": {"step": "subs", "slides": slides, "t": now()}, "$unset": {"subs": ""}})
-            return edit(chat, mid, subs_prompt(len(slides), extra), kb([[{"text": "⏭ بدون زیرنویس", "callback_data": "nosub"}]]))
-        db.sessions.update_one({"_id": uid}, {"$set": {"step": "voice", "t": now()}})
-        return edit(chat, mid, f"✅ {min(n, MAX_SLIDES)} اسلاید ثبت شد.{extra}\n\n🎙 حالا ویس کامل گوینده رو بفرست.")
+        show = bool(SUBS_OK)
+        db.sessions.update_one({"_id": uid}, {"$set": {"step": "subs", "slides": slides, "subs_show": show, "t": now(), "extra": extra},
+                                              "$unset": {"subs": ""}})
+        return edit(chat, mid, subs_prompt(len(slides), extra, show), subs_kb(show))
+
+    if data == "subshow":
+        if step != "subs" or not SUBS_OK:
+            return ans()
+        show = not s.get("subs_show", True)
+        db.sessions.update_one({"_id": uid}, {"$set": {"subs_show": show, "t": now()}})
+        ans()
+        return edit(chat, mid, subs_prompt(len(s["slides"]), s.get("extra", ""), show), subs_kb(show))
 
     if data == "nosub":
         if step != "subs":
             return ans()
         db.sessions.update_one({"_id": uid}, {"$set": {"step": "voice", "t": now()}, "$unset": {"subs": ""}})
         ans()
-        return edit(chat, mid, "✅ بدون زیرنویس.\n\n🎙 حالا ویس کامل گوینده رو بفرست.")
+        return edit(chat, mid, "✅ بدون سناریو (تقسیم فقط از روی صدا).\n\n🎙 حالا ویس کامل گوینده رو بفرست.")
 
     if step != "review":
         return ans("این مرحله دیگه فعال نیست.", True)
@@ -1299,6 +1345,10 @@ def on_callback(cq):
         ans()
         text, markup = review_view(s)
         return edit(chat, mid, text, markup)
+
+    if data == "dbg":
+        ans()
+        return say(chat, pause_report(s))
 
     if data.startswith("mode:"):
         mode = data[5:]
