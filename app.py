@@ -29,8 +29,8 @@ DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "5"))       # تعداد وید�
 ADMIN_IDS   = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 MAX_SLIDES  = int(os.environ.get("MAX_SLIDES", "8"))
 MAX_AUDIO   = int(os.environ.get("MAX_AUDIO", "90"))        # حداکثر طول ویس (ثانیه)
-VIDEO_W     = int(os.environ.get("VIDEO_W", "1080"))
-VIDEO_H     = int(os.environ.get("VIDEO_H", "1920"))
+VIDEO_W     = int(os.environ.get("VIDEO_W", "720"))
+VIDEO_H     = int(os.environ.get("VIDEO_H", "1280"))
 # فرمت‌های قابل انتخاب (نسبت عرض:ارتفاع)؛ ضلع کوتاه همیشه min(VIDEO_W, VIDEO_H)ـه تا رم و کیفیت ثابت بمونه
 FORMATS     = {"9x16": ("9:16 ریلز/استوری", 9, 16), "16x9": ("16:9 افقی/یوتیوب", 16, 9),
                "1x1": ("1:1 مربع", 1, 1), "4x5": ("4:5 پست اینستا", 4, 5)}
@@ -45,7 +45,7 @@ def fmt_size(key):
 
 
 FPS         = int(os.environ.get("FPS", "25"))
-PRESET      = os.environ.get("X264_PRESET", "veryfast")      # پاس نهایی؛ کلیپ‌های میانی همیشه ultrafast (سریع) ولی تقریباً بدون افت
+PRESET      = os.environ.get("X264_PRESET", "ultrafast")      # پاس نهایی؛ برای کیفیت بهتر (و کندتر) veryfast بذار
 CRF         = int(os.environ.get("CRF", "20"))               # کمتر = کیفیت بیشتر/حجم بیشتر (۱۸ تا ۲۳ حرفه‌ای)
 MAX_OUT_MB  = float(os.environ.get("MAX_OUT_MB", "47"))      # سقف حجم خروجی؛ تلگرام برای ربات‌ها ۵۰ مگ اجازه می‌ده
 MID_CRF     = int(os.environ.get("MID_CRF", "10"))           # کیفیت کلیپ‌های میانی (تقریباً بدون افت تا بعد از چندبار ادغام کیفیت نیفته)
