@@ -29,8 +29,8 @@ DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "5"))       # تعداد وید�
 ADMIN_IDS   = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 MAX_SLIDES  = int(os.environ.get("MAX_SLIDES", "8"))
 MAX_AUDIO   = int(os.environ.get("MAX_AUDIO", "90"))        # حداکثر طول ویس (ثانیه)
-VIDEO_W     = int(os.environ.get("VIDEO_W", "720"))
-VIDEO_H     = int(os.environ.get("VIDEO_H", "1280"))
+VIDEO_W     = int(os.environ.get("VIDEO_W", "1080"))
+VIDEO_H     = int(os.environ.get("VIDEO_H", "1920"))
 # فرمت‌های قابل انتخاب (نسبت عرض:ارتفاع)؛ ضلع کوتاه همیشه min(VIDEO_W, VIDEO_H)ـه تا رم و کیفیت ثابت بمونه
 FORMATS     = {"9x16": ("9:16 ریلز/استوری", 9, 16), "16x9": ("16:9 افقی/یوتیوب", 16, 9),
                "1x1": ("1:1 مربع", 1, 1), "4x5": ("4:5 پست اینستا", 4, 5)}
@@ -45,8 +45,10 @@ def fmt_size(key):
 
 
 FPS         = int(os.environ.get("FPS", "25"))
-PRESET      = os.environ.get("X264_PRESET", "ultrafast")
-CRF         = int(os.environ.get("CRF", "24"))
+PRESET      = os.environ.get("X264_PRESET", "veryfast")      # پاس نهایی؛ کلیپ‌های میانی همیشه ultrafast (سریع) ولی تقریباً بدون افت
+CRF         = int(os.environ.get("CRF", "20"))               # کمتر = کیفیت بیشتر/حجم بیشتر (۱۸ تا ۲۳ حرفه‌ای)
+MAX_OUT_MB  = float(os.environ.get("MAX_OUT_MB", "47"))      # سقف حجم خروجی؛ تلگرام برای ربات‌ها ۵۰ مگ اجازه می‌ده
+MID_CRF     = int(os.environ.get("MID_CRF", "10"))           # کیفیت کلیپ‌های میانی (تقریباً بدون افت تا بعد از چندبار ادغام کیفیت نیفته)
 SIL_DB      = os.environ.get("SIL_DB", "auto")              # آستانه‌ی سکوت؛ auto = از روی بلندی خود ویس حساب می‌شه
 SIL_MIN     = float(os.environ.get("SIL_MIN", "0.15"))      # حداقل طول مکث (ثانیه)؛ مکث‌های کوتاه هم دیده می‌شن، قدرتشون در DP سنجیده می‌شه
 DEBUG       = os.environ.get("DEBUG", "") == "1"            # علت دقیق خطا رو برای کاربر نشون می‌ده
@@ -561,7 +563,8 @@ def _slide_chain(idx, i_label, L, out_label):
     """یه اسلاید → استریم تمام‌صفحه‌ی ۹:۱۶ (بدون بلور، بدون کادر) با زوم خیلی نرم.
     ترکیب روی بوم بزرگ‌تر (ZOOM_CANVAS برابر) انجام می‌شه تا حرکت زوم پله‌پله/لرزان نشه؛ شتاب با smoothstep نرم شروع و تموم می‌شه"""
     W, H = VIDEO_W, VIDEO_H
-    cw, ch = int(W * ZOOM_CANVAS) // 2 * 2, int(H * ZOOM_CANVAS) // 2 * 2
+    zc = max(1.6, min(ZOOM_CANVAS, (9.5e6 / (W * H)) ** 0.5))      # سقف ~۹٫۵ مگاپیکسل تا رم تو رزولوشن بالا پر نشه
+    cw, ch = int(W * zc) // 2 * 2, int(H * zc) // 2 * 2
     p = f"(on/{L})"
     e = f"({p}*{p}*(3-2*{p}))"
     z = f"1+{ZOOM_AMT}*{e}" if idx % 2 == 0 else f"1+{ZOOM_AMT}-{ZOOM_AMT}*{e}"      # یکی در میون: زوم‌این / زوم‌اوت
@@ -605,7 +608,7 @@ def run_live(cmd, total, on_frame, timeout):
 XF_GROUP = int(os.environ.get("XF_GROUP", "5"))     # حداکثر تعداد کلیپ هم‌زمان تو یه پاس کراس‌فید؛ کمتر = رم کمتر
 
 
-def _xfade_files(grp, out, half, crf, run_fn, ass=None, frames=None):
+def _xfade_files(grp, out, half, crf, run_fn, ass=None, frames=None, preset=None):
     """grp = لیست (مسیر، فریم شروع روی خط زمانی کل، طول کلیپ)؛ همه رو با کراس‌فید می‌چسبونه و (مسیر، شروع، طول) برمی‌گردونه"""
     d_f = 2 * half
     s0 = grp[0][1]
@@ -624,7 +627,8 @@ def _xfade_files(grp, out, half, crf, run_fn, ass=None, frames=None):
         fc.append("[0:v]null[o]")
         last = "o"
     cmd += ["-filter_complex", ";".join(fc), "-map", f"[{last}]", "-frames:v", str(frames or total), "-r", str(FPS),
-            "-c:v", "libx264", "-preset", PRESET, "-crf", str(crf), "-threads", "1", "-pix_fmt", "yuv420p", "-an", out]
+            "-c:v", "libx264", "-preset", preset or PRESET, "-crf", str(crf), "-profile:v", "high",
+            "-threads", "1", "-pix_fmt", "yuv420p", "-an", out]
     run_fn(cmd, total)
     return (out, s0, total)
 
@@ -655,7 +659,7 @@ def build_video(imgs, nf, out, prog=None, ass=None):
         kp = os.path.join(wd, f"k{i}.mp4")
         run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", ip,
              "-filter_complex", _slide_chain(i, 0, L, "v"), "-map", "[v]", "-frames:v", str(L), "-r", str(FPS),
-             "-c:v", "libx264", "-preset", PRESET, "-crf", "16", "-threads", "1", "-pix_fmt", "yuv420p", "-an", kp],
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", str(MID_CRF), "-threads", "1", "-pix_fmt", "yuv420p", "-an", kp],
             timeout=left())
         items.append((kp, cum[i] - (half if i > 0 else 0), L))
 
@@ -671,7 +675,7 @@ def build_video(imgs, nf, out, prog=None, ass=None):
                 new.append(grp[0])
                 continue
             op = os.path.join(wd, f"g{level}_{j}.mp4")
-            new.append(_xfade_files(grp, op, half, 16, lambda c, t: run(c, timeout=left())))
+            new.append(_xfade_files(grp, op, half, MID_CRF, lambda c, t: run(c, timeout=left()), preset="ultrafast"))
         items, level = new, level + 1
 
     state = {"t": 0.0}
@@ -795,7 +799,7 @@ def mux(clips, voice, t0, dur, out, work, reencode_crf=None, ass=None, sfx=None)
     if reencode_crf or ass:
         if ass:
             cmd += ["-vf", ass_filter(ass)]
-        cmd += ["-c:v", "libx264", "-preset", PRESET, "-crf", str(reencode_crf or CRF), "-threads", "1", "-pix_fmt", "yuv420p"]
+        cmd += ["-c:v", "libx264", "-preset", PRESET, "-crf", str(reencode_crf or CRF), "-profile:v", "high", "-threads", "1", "-pix_fmt", "yuv420p"]
     else:
         cmd += ["-c:v", "copy"]
     cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2", "-movflags", "+faststart", "-shortest", out]
@@ -987,9 +991,19 @@ def render_job(uid):
             cum.append(cum[-1] + x)
         sfx = plan_sfx(cum, n)
         mux_safe(clips, vp, bounds[0], dur, out, work, sfx, ass=ass)
-        if os.path.getsize(out) > 49 * 1024 * 1024:
-            prog("🗜 حجم زیاده، فشرده‌سازی…")
-            mux_safe(clips, vp, bounds[0], dur, out, work, sfx, reencode_crf=34, ass=ass)
+        limit = MAX_OUT_MB * 1024 * 1024
+        crf_now = CRF
+        for _ in range(3):
+            sz = os.path.getsize(out)
+            if sz <= limit:
+                break
+            # هر +۶ در CRF تقریباً حجم رو نصف می‌کنه؛ فقط به‌اندازه‌ی لازم کیفیت کم می‌شه (نه یه‌دفعه تا ۳۴)
+            crf_now = min(36, crf_now + max(2, math.ceil(6 * math.log2(sz / (limit * 0.92)))))
+            prog(f"🗜 حجم {sz / 1048576:.0f}MB زیاده؛ تنظیم دقیق کیفیت (CRF {crf_now})…")
+            out2 = os.path.join(work, f"out_{crf_now}.mp4")
+            mux_safe(clips, vp, bounds[0], dur, out2, work, sfx, reencode_crf=crf_now, ass=ass)
+            out = out2
+        log.info("final video: %.1fMB crf=%s", os.path.getsize(out) / 1048576, crf_now)
         prog("📤 در حال ارسال…")
         with open(out, "rb") as f:
             r = tg_upload("sendVideo", {"chat_id": chat, "caption": "✅ ویدیوت آماده‌ست! برای ساخت بعدی /new",
